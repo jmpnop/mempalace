@@ -202,3 +202,90 @@ def scan(sqlite_path: str) -> list[str]:
 5. Live hub: 20-file mine; during the integrity tail every search's lock wait ≤ 5 s **and** run time ≤ 2× the median
    search run time measured with no mine running.
 6. Cleanup + `repair-status` OK.
+
+---
+
+# Revision 2 — 2026-11-20: Design B FAILED adversarial review; Design C proposed
+
+## Review of Design B (3 independent agents)
+A (complexity): FAIL (1 critical, 5 high). B (interface): FAIL (1 critical, 3 high). C (durability): CONDITIONAL PASS
+(4 high). Synthesis: **FAIL**. Verified points:
+- **Spec error (A1/B1/C2, critical).** Today's post-mine check runs only `PRAGMA quick_check` on a read-only connection
+  (`repair._quick_check_errors`). On SQLite ≥ 3.44 the pragma also walks FTS5 indexes (the `sqlite3Fts5IndexIntegrityCheck`
+  frames sampled in doc 06). FTS5's explicit `'integrity-check'` is an INSERT and needs a writable connection; it runs
+  only in repair's post-rebuild gate. "quick_check + FTS5 integrity-check, today's exact logic, read-only" was wrong.
+- **Isolation relocates the lock instead of removing it (A2/A3/C1/C6).** In rollback mode a foreign SHARED lock blocks
+  every COMMIT. Under B the hub's own Chroma writes and client opens (which write) would fail with BUSY after Chroma's
+  busy timeout (sqlx-sqlite 0.8.6 default 5 s; Chroma override unverified) instead of waiting — while holding
+  `palace_db_lock`. Windows keeps the pre-check close, so its first search during the check would fail.
+- **Failure semantics (A5/B4/C3, C4/A6/B5).** A child that dies (import failure under `-I`, kill, OOM, timeout) would be
+  reported as corruption → `MineValidationError`, MCP gate refusal, repair abort banner. An orphan cannot see stdin EOF
+  inside one C call and keeps SHARED for minutes.
+- **Boundary and tests (A4/B2, A9/B3/C8, A7, A10/C9).** The MCP gate calls `_quick_check_errors` directly, bypassing the
+  boundary; upstream tests pin "close before check" and in-process connect sequences; the no-hub heal would run with a
+  live client; the fallback was a never-shipped combination.
+- **Unfair rejection of A (B9).** A narrower in-process variant was never considered.
+
+## Design C — "Scan-Scoped Sharing" (in-process, `palace_db_lock` unchanged outside the scan)
+### Interface
+```python
+# backends/_inproc_sqlite.py
+def palace_db_lock(db_path) -> PalaceDbLock: ...   # drop-in for the RLock: with/acquire/release unchanged (exclusive, re-entrant)
+
+class PalaceDbLock:
+    def acquire(self, blocking=True) -> bool: ...  # exclusive, re-entrant — every existing site (Chroma writes/opens/closes/DDL, open_writer)
+    def release(self) -> None: ...
+    def acquire_read(self) -> None: ...            # used ONLY by open_reader: outside a scan window identical to acquire();
+    def release_read(self) -> None: ...            #   inside one, enters shared alongside the scanner and other readers
+
+@contextmanager
+def palace_scan_window(db_path): ...               # caller already holds the lock exclusively; for the body, other threads'
+                                                   # acquire_read() enter; acquire() waits (does not fail) and does not block
+                                                   # new readers; on exit, drains window readers, caller is exclusive again
+class PalaceLockOrderError(RuntimeError): ...      # a thread holding a window read slot asks for acquire() -> raised at once
+```
+- `repair._quick_check_errors` runs `PRAGMA quick_check` inside `palace_scan_window` — so every caller (post-mine
+  validation, the MCP startup/reconnect gate via `sqlite_integrity_status`, repair preflight) gets it (fixes A4/B2).
+- `palace._validate_palace_fts5_after_mine`: close the shared Chroma handles **as upstream does** (close-time
+  persistence, Windows mmap, "close before check" tests keep holding), then **reopen** the drawers and closets
+  collections while still exclusive, then check; the heal path closes again and runs exclusive as today.
+- The anchor/holder registry setup (`_ensure_anchor`, `_ensure_holder`), mutated under the exclusive lock today, gets
+  its own per-key setup mutex, because window readers may now run it concurrently.
+### Data flow
+Mine thread (hub, inside the `ef89c2cb` shared phase, or CLI): close handles → reopen collections → `_quick_check_errors`
+takes `palace_db_lock` exclusively, opens the scan window, runs quick_check with its own reader connection → other
+threads' `open_reader` calls (BM25, capacity probe, status) enter the window and run concurrently; Chroma vector reads
+use the reopened client (no lock); any Chroma write/open/close waits for the window to close (as today: waits, never
+BUSY, because the scanner is in-process and the wait is on `palace_db_lock`) → window closes after its readers leave →
+heal if needed → release.
+### Why this answers the review
+| Finding | Design C |
+|---|---|
+| A1/B1/C2 spec | the scan is exactly today's `PRAGMA quick_check`, unchanged connection and timeout |
+| A2/A3/C1 BUSY | no foreign process: writers wait on `palace_db_lock` exactly as today, never hit SQLite BUSY |
+| C3/A5/B4 child death = corruption | no child |
+| C4/A6/B5 orphan | no child; the hub's death releases everything as today |
+| A4/B2 boundary | the window lives in `_quick_check_errors`, the one function both entry points use |
+| A9/B3/C8 tests | close-before-check kept; in-process connect sequence kept; only the lock type grows |
+| A7 heal ordering | heal still closes the client and runs exclusive |
+| C5 concurrent scans | scans still serialize: each takes the lock exclusively first |
+| C6 external writers | unchanged from today (accepted, documented limit of rollback mode) |
+| B9 | this is the narrow variant B9 asked for |
+### Remaining risks (to be attacked in review round 2)
+1. Window readers run Python sqlite3 connections concurrently: safe within one SQLite library (its unix VFS tracks
+   its own connections per inode), but their *closes* happen while Chroma's client is open — the same exposure every
+   fast-path read already has today; to be gated on a WAL palace.
+2. Reopening the client before the scan costs a client open (9.5 s measured on 3.10 incl. HNSW quarantine) inside the
+   exclusive section — measured in the live gate.
+3. Lock-order error must never fire on a hub path — gated by the full suite and a live mine with concurrent searches.
+
+## Gates for Design C (written before code)
+1. Unit (lock): window admits concurrent readers; `acquire()` during the window waits and succeeds after it; a waiting
+   `acquire()` does not block new window readers; outside a window `acquire_read()` is exactly exclusive (upstream
+   semantics); re-entrancy; `PalaceLockOrderError` on read-slot→exclusive; registry setup race.
+2. Upstream: `tests/test_inproc_sqlite_locks.py` unchanged and green (incl. torn-read probes, rollback + WAL), full
+   suite green apart from the two failures documented in doc 06; plus a new torn-read test: a Chroma writer thread and
+   reader threads running during an open scan window → 0 "malformed", 0 writer errors (writes waited).
+3. Negative controls for gate 1 on the current code.
+4. Live hub: 20-file mine; during the integrity tail every search's lock wait ≤ 5 s and run time ≤ 2× the idle median.
+5. Cleanup + `repair-status` OK.

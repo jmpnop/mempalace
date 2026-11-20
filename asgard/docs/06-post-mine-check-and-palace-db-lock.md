@@ -7,7 +7,7 @@ open (see "Next").
 
 ## Problem (from 04, gate U3 on 3.12.0)
 After a mine's writes, `palace._validate_palace_fts5_after_mine` closes the shared Chroma client and runs
-`PRAGMA quick_check` plus FTS5's own integrity check over the 7.2 GB `chroma.sqlite3`. On 3.12.0 it runs under the
+`PRAGMA quick_check` over the 7.2 GB `chroma.sqlite3` (on SQLite ≥ 3.44 the pragma also walks the FTS5 index — the `sqlite3Fts5IndexIntegrityCheck` frames sampled below; the explicit FTS5 `'integrity-check'` INSERT runs only in repair's post-rebuild gate). On 3.12.0 it runs under the
 mine's exclusive hub request lock with no yield point, so a search waited **578 s** for the lock.
 
 ## Step 1 — let readers through the hub lock during the check (`ef89c2cb`)
