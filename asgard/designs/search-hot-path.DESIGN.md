@@ -138,3 +138,48 @@ def _capacity_backstop_seconds(fingerprint: tuple) -> float:
    fingerprint is incomplete (missing segment id, `None` sqlite count) — today those are never cached.
 4. Gate G4 (closet boosts identical) and G5 (search results identical) must include wings with and without closets,
    numeric-valued filters, `$and` with room, and palace-wide queries.
+
+---
+
+# Revision 2 — 2026-11-20: review round 1 → CONDITIONAL PASS (A: CONDITIONAL, B: FAIL, C: CONDITIONAL)
+
+B's FAIL is calibrated to CONDITIONAL PASS: each of its HIGH findings has a contained fix inside the same three
+changes; none requires a different primary abstraction. Fix 1 was confirmed exact by all three (A: identical first
+value, 3.44 s → 0.0004 s; C: identical on the clone and on a synthetic table with int/float/bool/string wings; A: no
+other query in the package has the same missing-partial-index form).
+
+| # | Finding (raised by) | Required change |
+|---|---|---|
+| R1 | The capacity verdict depends on wall-clock time, not only on files: `stale_below_threshold` flips "ok" → "diverged" when the pickle reaches 300 s of age (`_HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS`), for collections without explicit `hnsw:sync_threshold` and 0 < divergence ≤ threshold; 2B's 3600 s backstop would hold the stale "ok" up to an hour (B2, A3, C1 — measured by C) | a cached verdict carries an **expiry**: if it depends on age (`not has_explicit_sync_threshold and divergence > 0 and hnsw_metadata_age_seconds is not None`), expiry = the wall-clock moment the age reaches the grace (re-probe then); expiry uses `time.time()` (a monotonic clock stops during sleep, C1) |
+| R2 | `mtime_ns % 1e9 == 0` misclassifies exFAT (10 ms; mtime frozen while the writer keeps the file open — measured), pre-6.13 Linux ext4/xfs/btrfs (jiffy ticks with ns digits), NFS/SMB (B3, A4, C2) | the long backstop applies only on an **allow-list of filesystem types** read once per palace with `statfs` (macOS `f_fstypename == "apfs"`); every other filesystem keeps today's 10 s; absent files never decide (A8) |
+| R3 | `index_metadata.pickle` absent → the verdict reads the payload size, which is not fingerprinted (C7) | when `hnsw_count is None` the short backstop applies |
+| R4 | `_equality_sizes` counts every collection, so it can never return 0 for a wing with drawers: Fix 3A as written never fires (B1, A1, C5 — measured: wing `mempalace` 11 rows, 0 closets) | an **`EXISTS … LIMIT 1` restricted to the target collection** (join embeddings → segments → collections), short-circuiting on the first row: 0.000 s for wings with closets, ≤ 0.002 s for wings without (measured A, C); a COUNT would add up to 1.9 s (rejected) |
+| R5 | Fix 3 placement: the searcher must not know Chroma sqlite (B7, A6) | the skip lives in **`chroma_sqlite.sqlite_lexical_rows`**, for any collection: `_string_equalities(encode_where(where))` must return equalities (else today's path); if any equality has no row in that collection → return `[]` (exactly today's output for that input — `_decoded_rows(where)` keeps nothing). `_closet_boosts` unchanged. Values are encoded as stored (escape prefix); numeric values never reach the skip (`_string_equalities` returns None) |
+| R6 | Cost model misstated: under a `where` there is no `ORDER BY rank`; warm cost is the unbounded MATCH + `_decoded_rows` (≤ 1.4 s); the 3.9–7.2 s was cold page-in; pushing the wing filter into SQL is slower (2.4–7.4 s) (A7, B8) | table corrected here; the push-down is recorded as rejected |
+| R7 | An in-house option was missing: `_filtered_candidate_rows` reads a small scope's own text (≤ 20,000 rows) with the trigram-equivalent substring test (B8) | **Design 3D** — evaluated, adopted **only if** the exact-equality gates (G4/G5 below) pass on the clone and the synthetic palace; otherwise recorded as rejected with the measured difference |
+| R8 | Gates could not fail honestly: G2 tested a known-wings change the design declines; G4 had an "explained differences" escape and a speed claim 3A cannot meet; G5 compared ids only; G9 compared against a palace other sessions keep writing to and passed on error responses (B4, B5, B6, A5, C3, C4, C6) | gates rewritten (GATES.md, revision 2): exact equality of the full `_closet_boosts` dict and of the full `tool_search` JSON minus timings; required query classes; a synthetic palace with int/float/escaped wings, `$and` with room, `$in` aliases, an AAAK-refetch case, a no-token query; speed claimed only for scopes without closets, no regression > 5 % elsewhere; G9 runs installed vs fork code on one fresh APFS clone of the live palace (frozen state) plus a live smoke check that fails on any `error` or empty result |
+| R9 | Tests and comments encode the old policy: `tests/test_hnsw_capacity.py::test_verdict_is_not_reused_past_the_age_ceiling`, `_guards.py` comment on the 10 s ceiling, `chroma.py` comments ("never fires in practice"; "costs milliseconds") (B9, A8) | listed as changes: the test splits into coarse-fs (10 s re-probe), allow-listed fs (reuse past 10 s), age-dependent expiry, payload-absent cases; comments corrected |
+
+## Fix 2 (final) — `_capacity_cache_expiry(fingerprint_paths, status, probed_at_wall)`
+```python
+def _capacity_reuse_deadline(palace_path: str, status: dict, probed_at: float) -> float:
+    """Wall-clock time until which a capacity verdict may be reused while its files' signatures are unchanged.
+
+    The stat signature catches every write only where timestamps are fine-grained and updated per write; that is
+    established per palace from the filesystem type (an allow-list, today APFS), never inferred from timestamp
+    digits. Elsewhere the reuse window stays at the short backstop (10 s), as before this change.
+    A verdict can also change with no file changing: a sub-threshold divergence becomes "diverged" once the HNSW
+    metadata is older than the grace period. Such a verdict is reused at most until that moment.
+    A verdict measured without an HNSW element count reads files the signature does not cover: short backstop.
+    """
+```
+## Fix 3 (final) — in `sqlite_lexical_rows`
+```python
+# A filter whose string equalities name a value no row of this collection holds can match nothing, and the
+# full-text query below would only produce rows that `_decoded_rows(where)` then drops. Checking one EXISTS per
+# equality (stops at the first row; collection-scoped, values encoded as stored) replaces a palace-wide MATCH that
+# costs seconds — scoped searches over wings filed without closets paid it to produce an empty boost.
+# Consistency: the check and the MATCH read separate snapshots; a mine that commits a wing's first closet between
+# them yields the result the request would have had a moment earlier — acceptable for a rank boost.
+```
+Design 3D (filter-driven read of small scopes) is evaluated against the same gates before it can be adopted.
