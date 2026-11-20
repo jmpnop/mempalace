@@ -1,4 +1,4 @@
-# mp_call.py — drive mempalace-mcp (the same stdio proxy Claude Code uses) for one tools/call.
+# mp_call.py — drive mempalace-mcp (the same stdio proxy MCP clients use) for one tools/call.
 import json, subprocess, sys, time
 tool, args = sys.argv[1], json.loads(sys.argv[2])
 p = subprocess.Popen([__import__("os").path.expanduser("~/.local/bin/mempalace-mcp")], stdin=subprocess.PIPE,
