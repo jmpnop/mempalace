@@ -219,3 +219,100 @@ def quick_check_snapshot(palace_path, *, scan_phase=contextlib.nullcontext) -> O
    every search's lock wait ≤ 5 s and run time ≤ 2× the idle median; the mine's tail no longer holds
    `palace_db_lock` (hub sample shows no `rlock_acquire` stall); `repair-status` OK; no files left in
    `.integrity-snapshots/`.
+
+---
+
+# Revision 2 — 2026-11-20: round-3 review → CONDITIONAL PASS; required changes folded in
+
+## Review synthesis
+A (complexity): FAIL (1 critical). B (interface): CONDITIONAL PASS. C (durability): CONDITIONAL PASS. A's critical A1 is
+calibrated to HIGH: B (B8) and C (C5) examined the same code and rated it MEDIUM, and its fix is a contract rule, not a
+redesign. No finding requires redesigning the primary abstraction → **CONDITIONAL PASS**. Agent C confirmed the core
+mechanism by experiment: a real Chroma `PersistentClient` writing in another process (rollback, Chroma's SQLite 3.46.0,
+POSIX fcntl locks — same lock bytes as Python's): 300/300 clones consistent under a read transaction, 3/300 torn
+without; `clonefile` sees unflushed writes and is atomic against concurrent `pwrite`; db-then-`-wal` order is safe
+under WAL read-mark rules; a hot journal makes the read transaction fail → no snapshot.
+
+| # | Finding (raised by) | Required change | Where below |
+|---|---|---|---|
+| R1 | Precondition "no live Chroma client" is best-effort: `_close_chroma_handles` swallows every error; a surviving client's unlock even drops this process's POSIX read lock (A2, B1, C1 — measured by C, e6) | the read transaction and the clone run **in a short-lived helper process**: its lock excludes every writer of every other process *including this one* (C6, measured: in-process Chroma `add` waited 1.05 s / 3.08 s behind a helper's 1 s / 3 s hold); plus an own-descriptor tripwire | Mechanism |
+| R2 | Opening the clone through `open_reader` installs an anchor (Linux) / helper (macOS) keyed on the clone path, pinning the unlinked clone (A1, B8, C5) | the clone is opened only with `sqlite3.connect("file:…?mode=ro&immutable=1", uri=True)` inside `_inproc_sqlite`; never through `open_reader`; gate asserts no clone key in `_anchors`/`_holders` | Mechanism, G8 |
+| R3 | Clones survive SIGTERM→SIGKILL hub restarts; pid-based clean-up fails on pid reuse and containers (C2, A5) | **unlink after open**: every clone name is deleted right after the immutable open; the kernel frees it on any process death; no pid scheme | Mechanism |
+| R4 | `.integrity-snapshots/` inside the palace is byte-copied by `copy_palace_dir` (repair backup, migrate) (A4, B9, C3) | the clone name exists only between clone and open (milliseconds) in `<palace>/.integrity-snapshots/` (same volume is required by `clonefile`); `copy_palace_dir` and `_carry_over_palace_files` skip that directory explicitly | Mechanism, G9 |
+| R5 | `None` hides why there is no snapshot; the stall returns silently (B2, A7, C4) | the primitive returns a `SnapshotStatus(path | None, reason)`; the caller logs the reason at warning level; live gate asserts the snapshot path was taken | Interface |
+| R6 | `Optional[list[str]]` is an ad-hoc tri-state beside `SqliteIntegrityStatus`; clone-open failures read as corruption (B3) | `quick_check_snapshot` returns `SqliteIntegrityStatus` (`checked`, `errors`, `reason`): `checked=False` for no snapshot *and* for a clone that could not be opened/scanned | Interface |
+| R7 | WAL clone opened read-only without `-shm` fails on Apple SQLite (B4) | WAL: fold the cloned `-wal` into the private clone (`wal_checkpoint(TRUNCATE)`, `journal_mode=delete`) before the immutable open — measured: one file, no sidecars, `quick_check` ok | Mechanism |
+| R8 | Fallback ambiguous; the corruption path costs clone scan + exclusive live scan (A6, B5) | one rule: **no verdict → today's path exactly** (live check inside `mine_shared_phase`); **bad verdict → today's path exactly** (live check inside `mine_shared_phase`, then close + heal as today). Stated cost on real corruption: one extra scan of the clone (~256 s here), only on that rare path | Data flow |
+| R9 | `scan_phase` leaks hub policy into repair and swallows the `shared` flag (B6) | removed: the caller composes `snapshot_database` → `mine_shared_phase` → scan; the `shared` flag stays with the caller | Interface |
+| R10 | Tests that stub `sqlite_integrity_errors` stop exercising heal/raise routing on reflink filesystems; suite splits by platform (A3, B7) | the snapshot check is its own seam (`repair.quick_check_snapshot`); existing tests stub it to `checked=False` by an autouse fixture (fallback = today's path, so their meaning is unchanged); new tests cover the snapshot routing explicitly | Tests |
+| R11 | Free-space rule measured once, ignores other pinned clones; ENOSPC on live overwrites (C4) | with unlink-after-open no stale clones exist; rule: free space ≥ database size + 10 % at clone time, else `reason="low free space"`; ENOSPC gate on a small APFS image | G10 |
+| R12 | "clone bad, live clean" discards the only evidence of a broken precondition (B10) | logged at warning level with both verdicts | Data flow |
+| R13 | Filesystems accepted by errno alone (OpenZFS block cloning had corruption bugs) (C8) | allow-list by `statfs` type: `apfs`, `btrfs`, `xfs`; everything else → `reason="filesystem <type> not allow-listed"`; ext4 documented as today's path | Mechanism |
+| R14 | Gates miss real writers and failure modes (C7) | G1–G12 below | Gates |
+
+## Mechanism (revised)
+`snapshot_database(db_path) -> SnapshotStatus` in `backends/_inproc_sqlite.py` (context manager):
+1. Refuse early, with a reason: filesystem type not in the allow-list (`statfs`); free space < db size × 1.1.
+2. Own-descriptor tripwire: enumerate this process's descriptors (`/dev/fd` + `fstat`, or `/proc/self/fd`), match
+   `(st_dev, st_ino)` of the db, `-wal`, `-journal`; the module's own anchor guards are released first through the
+   existing `release(db_path)` (it exists "for maintenance that needs the file to itself once Chroma's handles are
+   closed"). Any remaining match → warning log + `reason="live descriptor on the database in this process"` →
+   no snapshot. (Measured: a live Chroma client shows 2 descriptors; after `_close_chroma_handles`, none.) With R1 this
+   is a tripwire, not the safety mechanism.
+3. Under `palace_db_lock(db_path)` (excludes mempalace's own writers and Chroma client opens/closes for the instant):
+   run the helper — `python -I -c <self-contained script>` (the `_HOLD_SCRIPT` rule: imports nothing from mempalace):
+   open the live db, `BEGIN`, read one page (SHARED / WAL read mark), clone db then `-wal` with `clonefile` (macOS) or
+   `ioctl(FICLONE)` (Linux), `COMMIT`, print one JSON line, exit. Helper timeout 10 s (busy timeout inside it 5 s);
+   any failure → `reason=...`, clone names removed.
+4. Release `palace_db_lock`. WAL clone: open it read-write (private file), `PRAGMA wal_checkpoint(TRUNCATE)`,
+   `PRAGMA journal_mode=delete`, close.
+5. Open the clone `mode=ro&immutable=1` with plain `sqlite3`; **unlink every clone name**; yield
+   `SnapshotStatus(connection, reason="")`. The block runs `PRAGMA quick_check` on that connection; on exit the
+   connection is closed and the kernel frees the clone.
+The clone directory `<palace>/.integrity-snapshots/` holds a name only between steps 3 and 5.
+
+## Interface (revised)
+```python
+# backends/_inproc_sqlite.py
+@dataclass(frozen=True)
+class SnapshotStatus:
+    connection: Optional[sqlite3.Connection]   # read-only, immutable, already unlinked; None = no snapshot
+    reason: str                                # "" when taken; otherwise why not (logged by the caller)
+
+@contextmanager
+def snapshot_database(db_path: str) -> Iterator[SnapshotStatus]: ...
+
+# repair.py
+def quick_check_snapshot(snapshot: SnapshotStatus) -> SqliteIntegrityStatus: ...
+#   checked=False (reason) when there is no snapshot or the clone could not be scanned; else checked=True + errors.
+```
+## Data flow (revised) — `_validate_palace_fts5_after_mine`
+close handles (as today) → `with snapshot_database(db) as snap:` → `with mine_shared_phase() as shared:` →
+`status = quick_check_snapshot(snap)` → then:
+- `checked and not errors` → return (clean).
+- `not checked` → warning log `status.reason` → **today's code path exactly**.
+- `checked and errors` → warning log → **today's code path exactly** (live check in the shared phase; close + heal +
+  `MineValidationError` as today); if the live check is clean, warning "snapshot verdict disagreed with the live file".
+
+## Gates (replace the earlier list)
+- G1 Torture, Python writer process, rollback + WAL, ≥ 300 snapshots each → 0 inconsistent; negative control (no read
+  transaction) must show torn clones.
+- G2 Torture, **Chroma `PersistentClient` writer process**, ≥ 1,000 snapshots (its torn rate without the lock is low:
+  3/300) → 0 inconsistent; negative control shows ≥ 1 torn.
+- G3 **In-process Chroma client deliberately left open and writing** during snapshots: the tripwire refuses; with the
+  tripwire disabled (test hook), helper-held lock still yields 0 inconsistent clones (proves R1 independently).
+- G4 WAL storms: a third process looping `wal_checkpoint(RESTART)`/`(TRUNCATE)`, a writer at `wal_autocheckpoint=10`,
+  and a reader starting on a fully backfilled WAL → 0 inconsistent.
+- G5 Kill paths: SIGKILL of the process holding a snapshot, and `launchctl kickstart -k` of the hub during the scan →
+  no name left in `.integrity-snapshots/`, free space returned (`statvfs` before/after).
+- G6 Fallbacks with reasons: HFS+ image, filesystem not allow-listed, low free space, helper failure/timeout, hot
+  journal → `checked=False` with the expected reason; the mine then runs today's live check.
+- G7 Verdict routing: clean → no live check; corrupt clone (fixture) → today's path; disagreement warning logged.
+- G8 No clone key in `_anchors`, `_holders` or `_locks` after a snapshot.
+- G9 `copy_palace_dir` / migrate carry-over skip `.integrity-snapshots/`.
+- G10 ENOSPC: 200 MB APFS image with a ~120 MB database: below threshold → `checked=False`; at threshold with full
+  rewrites during the scan → no `SQLITE_FULL` on the live file.
+- G11 Upstream suite green apart from doc 06's two known failures, with the autouse fixture; new snapshot tests pass on
+  macOS (APFS) and on a Linux runner (ext4 → fallback path; btrfs/xfs loop image → snapshot path) where available.
+- G12 Live hub: 20-file mine with concurrent searches; log shows the snapshot path was taken; during the tail every
+  search's lock wait ≤ 5 s and run ≤ 2× idle median; no `rlock_acquire` stall in a hub sample; `repair-status` OK.

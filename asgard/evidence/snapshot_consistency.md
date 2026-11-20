@@ -14,3 +14,13 @@ Scripts: `snapshot_snapprobe.py` (clone the real 7.2 GB palace database under a 
 {"mode": "wal", "DONE": true, "iterations": 300, "bad": 0}
 negative control (no read transaction): 83 of 168 clones inconsistent; then: sqlite3.DatabaseError: database disk image is malformed
 ```
+
+## Helper-process clone, immutable open, unlink after open (`snapshot_unlinkprobe.py`, ~80 MB database)
+```
+{"mode": "delete", "helper_s": 0.089, "sidecars_left": [], "name_gone": true, "quick_check_unlinked": "ok", "rows_in_clone": 20000, "MB_pinned_while_open": 82.2, "MB_returned_on_close": 82.0}
+{"mode": "wal", "helper_s": 0.09, "sidecars_left": [], "name_gone": true, "quick_check_unlinked": "ok", "rows_in_clone": 20000, "MB_returned_on_close": 82.3}
+```
+## Own-descriptor tripwire (`snapshot_fdprobe.py`, real chromadb client in-process)
+```
+{"before": [], "chroma_open_after_write": [9, 10], "after_mempalace_close": [], "own_reader_open": [3], "after_own_reader_close": []}
+```
