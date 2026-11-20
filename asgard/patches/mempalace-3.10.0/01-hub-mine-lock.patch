@@ -1,0 +1,330 @@
+--- a/mempalace/mcp_server/http.py	2026-11-20 09:03:07
++++ b/mempalace/mcp_server/http.py	2026-11-20 07:57:31
+@@ -71,6 +71,12 @@
+ 
+ 
+ _HTTP_REQUEST_LOCK = _RWLock()
++# Local patch: long tool calls hold the lock shared and go exclusive per write
++# batch (see mempalace/hub_lock.py) instead of exclusive for the whole call.
++from .. import hub_lock as _hub_lock
++
++_hub_lock.install(_HTTP_REQUEST_LOCK)
++_HTTP_LONG_OPERATION_TOOLS = frozenset({"mempalace_mine"})
+ _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+ _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+ 
+@@ -377,6 +383,9 @@
+         tool_name = request["params"].get("name")
+     if tool_name in _HTTP_LOCK_FREE_TOOLS:
+         return handle_request(request)
++    if tool_name in _HTTP_LONG_OPERATION_TOOLS:
++        with _hub_lock.long_operation():
++            return handle_request(request)
+     # service.classify_tool is the authoritative read/write registry. The
+     # lock-free set above is a storage-boundary override for independent DBs.
+     from ..service import classify_tool
+--- a/mempalace/mcp_server/_session.py	2026-11-20 09:03:07
++++ b/mempalace/mcp_server/_session.py	2026-11-20 09:44:40
+@@ -52,6 +52,18 @@
+ 
+     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
+     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
++
++    # Local patch: while this hub runs a long operation (mempalace_mine) it
++    # holds the palace writer lease, so an mtime-only change is this process's
++    # own write. Resetting chromadb's shared cache here would kill the client
++    # the long operation is writing through. Re-baseline instead; an inode
++    # change or a missing DB still reconnects below.
++    if _client_cache is not None and mtime_changed and not inode_changed:
++        from .. import hub_lock
++
++        if hub_lock.long_operation_active():
++            _palace_db_mtime = current_mtime
++            return _client_cache
+ 
+     if _client_cache is None or inode_changed or mtime_changed:
+         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
+@@ -59,7 +71,17 @@
+         # the whole MCP server (#1222). The probe is pure sqlite +
+         # metadata read; never touches the HNSW binary files.
+         _refresh_vector_disabled_flag()
+-        if inode_changed or mtime_changed:
++        from .. import hub_lock
++
++        # Local patch: during a long operation the shared chromadb System is
++        # this process's own, current one (the hub holds the writer lease) and
++        # the long operation is writing through it, so only a genuine file
++        # replacement (inode change against a known previous inode) may reset
++        # it. A cold open has no previous inode or mtime (both baselines are 0),
++        # which makes both checks read as "changed"; that is not a replacement.
++        replaced = inode_changed and _palace_db_inode != 0
++        reset_allowed = replaced or not hub_lock.long_operation_active()
++        if (inode_changed or mtime_changed) and reset_allowed:
+             ChromaBackend._quarantined_paths.discard(_config.palace_path)
+             # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
+             # caches its System (and the live HNSW segment) keyed by path, so
+--- a/mempalace/mcp_server/tools_read.py	2026-11-20 09:03:07
++++ b/mempalace/mcp_server/tools_read.py	2026-11-20 08:05:39
+@@ -669,7 +669,13 @@
+         # Post-bulk-write HNSW flush window (#1315): drop caches, give
+         # the segment a moment to settle, retry once. Caller never sees
+         # the transient unless the second attempt also fails.
+-        _force_chroma_cache_reset()
++        # Local patch: a mine running on another thread is still writing
++        # through the shared chromadb client; resetting it would kill the mine.
++        # Retry without the reset in that case.
++        from .. import hub_lock
++
++        if not hub_lock.another_thread_in_long_operation():
++            _force_chroma_cache_reset()
+         time.sleep(2)
+         _refresh_vector_disabled_flag()
+         result = search_memories(
+--- a/mempalace/mcp_server/tools_diary.py	2026-11-20 09:03:07
++++ b/mempalace/mcp_server/tools_diary.py	2026-11-20 08:05:39
+@@ -363,7 +363,16 @@
+         _vector_disabled, \
+         _vector_disabled_reason
+     from .. import palace as palace_module
++    from .. import hub_lock
+ 
++    # Local patch: reconnect tears down the shared chromadb client; a mine
++    # running on another thread is still writing through it.
++    if hub_lock.another_thread_in_long_operation():
++        return {
++            "success": False,
++            "error": "a mine is running in this hub; reconnect after it finishes",
++        }
++
+     close_errors = []
+     palace_ref = PalaceRef(id=_config.palace_path, local_path=_config.palace_path)
+     closed_backend_names = set()
+--- a/mempalace/backends/chroma.py	2026-11-20 09:03:07
++++ b/mempalace/backends/chroma.py	2026-11-20 09:44:40
+@@ -2301,19 +2301,24 @@
+         it had already paid for. That made the file-a-drawer-then-search cycle
+         reload the whole index each time.
+         """
+-        if self._palace_path is None:
+-            yield
+-            return
+-        # Late import — palace.py imports ChromaBackend from this module.
+-        from ..palace import mine_palace_lock
+-
+-        with mine_palace_lock(self._palace_path):
+-            try:
++        # Local patch: inside a hub long operation (mempalace_mine) the write
++        # batch holds the hub request lock exclusively; elsewhere a no-op.
++        from .. import hub_lock
++
++        with hub_lock.exclusive():
++            if self._palace_path is None:
+                 yield
+-            finally:
+-                if self._backend is not None:
+-                    self._backend._restamp(self._palace_path)
++                return
++            # Late import — palace.py imports ChromaBackend from this module.
++            from ..palace import mine_palace_lock
+ 
++            with mine_palace_lock(self._palace_path):
++                try:
++                    yield
++                finally:
++                    if self._backend is not None:
++                        self._backend._restamp(self._palace_path)
++
+     # ------------------------------------------------------------------
+     # Writes
+     # ------------------------------------------------------------------
+@@ -3059,6 +3064,18 @@
+             and cached_mtime != 0.0
+             and abs(current_mtime - cached_mtime) > 0.01
+         )
++
++        # Local patch: while this hub process runs a long operation
++        # (mempalace_mine), it holds the palace writer lease, so an mtime-only
++        # change is this process's own write. Rebuilding here would drain the
++        # client the long operation is still writing through. Re-baseline
++        # instead; an inode change or a missing DB still rebuilds below.
++        if cached is not None and mtime_changed and not inode_changed:
++            from .. import hub_lock
++
++            if hub_lock.long_operation_active():
++                self._freshness[palace_path] = (current_inode, current_mtime)
++                return cached
+ 
+         if cached is None or inode_changed or mtime_changed or mtime_appeared:
+             # Drop the per-process quarantine gate so the HNSW pre-checks
+--- a/mempalace/palace/palace_lock.py	2026-11-20 09:03:07
++++ b/mempalace/palace/palace_lock.py	2026-11-20 08:32:03
+@@ -51,31 +51,41 @@
+ 
+     # Defer-import: keeps the repair module graph out of mine's hot import path.
+     from ..repair import _close_chroma_handles, maybe_autoheal_fts5_index, sqlite_integrity_errors
++    from .. import hub_lock
+ 
+-    # Pass the live singleton so the writer's cached PersistentClient actually
+-    # gets closed and WAL flushes before the read-only sqlite3 re-open.
+-    # A transient ChromaBackend (the default) would only clear its own empty
+-    # `_clients` dict and leave _DEFAULT_BACKEND's live handle in place,
+-    # which on Windows keeps the sqlite file mmap'd.
+-    _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
++    # Local patch: closing the process-wide chroma client must not overlap other
++    # sessions' reads, so inside a hub long operation (mempalace_mine) it runs
++    # exclusive. The quick_check that follows reads through its own read-only
++    # sqlite3 connection and takes many minutes on a multi-GB palace; it keeps
++    # the shared hold so other sessions' reads continue. The FTS5 auto-heal
++    # rebuilds an index, so it runs exclusive again.
++    with hub_lock.exclusive():
+ 
++        # Pass the live singleton so the writer's cached PersistentClient actually
++        # gets closed and WAL flushes before the read-only sqlite3 re-open.
++        # A transient ChromaBackend (the default) would only clear its own empty
++        # `_clients` dict and leave _DEFAULT_BACKEND's live handle in place,
++        # which on Windows keeps the sqlite file mmap'd.
++        _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
++
+     errors = sqlite_integrity_errors(palace_path)
+-    if errors:
+-        # Not the default print: this runs inside the MCP server process too
+-        # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
+-        # transport -- a stray print() here would corrupt the protocol stream
+-        # and crash the connection.
+-        #
+-        # warning, not info: this module logs through the `mempalace_mcp`
+-        # logger, which sets no level of its own, and nothing configures logging
+-        # on the `mempalace mine` path -- so root keeps its default and info
+-        # records are dropped. Every message this call can emit describes a palace whose
+-        # quick_check already failed -- a rebuild being attempted, refused, or
+-        # completed against the operator's data -- so warning is both the level
+-        # that survives and the level that fits.
+-        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
+-    if errors:
+-        raise MineValidationError(palace_path, errors)
++    with hub_lock.exclusive():
++        if errors:
++            # Not the default print: this runs inside the MCP server process too
++            # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
++            # transport -- a stray print() here would corrupt the protocol stream
++            # and crash the connection.
++            #
++            # warning, not info: this module logs through the `mempalace_mcp`
++            # logger, which sets no level of its own, and nothing configures logging
++            # on the `mempalace mine` path -- so root keeps its default and info
++            # records are dropped. Every message this call can emit describes a palace whose
++            # quick_check already failed -- a rebuild being attempted, refused, or
++            # completed against the operator's data -- so warning is both the level
++            # that survives and the level that fits.
++            errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
++        if errors:
++            raise MineValidationError(palace_path, errors)
+ 
+ 
+ # Process-wide record of palaces this PROCESS already holds the lock for. Used
+--- /dev/null	2026-11-20 09:44:50
++++ b/mempalace/hub_lock.py	2026-11-20 08:15:02
+@@ -0,0 +1,103 @@
++"""Per-batch exclusivity for long-running hub tool calls (local patch).
++
++The HTTP hub serializes palace access with a readers-writer lock
++(``mcp_server.http._HTTP_REQUEST_LOCK``): reads share it, writes take it
++exclusively. A ``mempalace_mine`` call used to take it exclusively for the
++whole run, so a mine of a large project stalled every other session's tool
++calls for minutes.
++
++A long operation instead holds the lock *shared* for its whole run — so all
++its own reads, collection opens and cache work count as a reader — and steps
++up to *exclusive* only around each storage write batch and around steps that
++replace process-wide storage handles. Other sessions' reads run alongside the
++mine; their writes run between the mine's write batches, never during one.
++
++Outside a long operation (every other tool, the CLI, tests) both context
++managers are no-ops: the dispatcher already holds the right lock mode, and
++the lock is not re-entrant, so re-acquiring it would self-deadlock.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import threading
++
++_rw = None  # the hub's _RWLock, installed by mcp_server.http
++_tls = threading.local()  # .mode: None | "r" (long operation) | "w" (inside a write batch)
++_active_guard = threading.Lock()
++_active = 0  # long operations running in this process (any thread)
++
++
++def long_operation_active() -> bool:
++    """True while any thread of this process is inside ``long_operation()``.
++
++    The chroma backend uses this to tell its own writes apart from an external
++    rebuild: a long operation keeps collection handles open across its write
++    batches, so tearing the shared client down underneath it breaks the run.
++    """
++    return _active > 0
++
++
++def in_long_operation_thread() -> bool:
++    """True when the calling thread is itself running a long operation."""
++    return getattr(_tls, "mode", None) is not None
++
++
++def another_thread_in_long_operation() -> bool:
++    """True when a long operation is running on some *other* thread of this process."""
++    return long_operation_active() and not in_long_operation_thread()
++
++
++def install(rw) -> None:
++    """Register the hub's readers-writer lock. Called once by the HTTP transport."""
++    global _rw
++    _rw = rw
++
++
++@contextlib.contextmanager
++def long_operation():
++    """Run the body holding the hub lock shared; ``exclusive()`` inside it upgrades per batch."""
++    if _rw is None or getattr(_tls, "mode", None) is not None:
++        yield
++        return
++    global _active
++    _rw.acquire_read()
++    _tls.mode = "r"
++    with _active_guard:
++        _active += 1
++    try:
++        yield
++    finally:
++        with _active_guard:
++            _active -= 1
++        mode = _tls.mode
++        _tls.mode = None
++        if mode == "r":
++            _rw.release_read()
++        elif mode == "w":
++            _rw.release_write()
++
++
++@contextlib.contextmanager
++def exclusive():
++    """Inside a long operation: hold the hub lock exclusively for the body.
++
++    Releases the shared hold first (the lock cannot upgrade in place), so a
++    waiting writer from another session may run before this batch; the shared
++    hold is re-taken afterwards. No-op outside a long operation or when this
++    thread is already exclusive.
++    """
++    if getattr(_tls, "mode", None) != "r":
++        yield
++        return
++    _rw.release_read()
++    _tls.mode = None
++    _rw.acquire_write()
++    _tls.mode = "w"
++    try:
++        yield
++    finally:
++        _rw.release_write()
++        _tls.mode = None
++        _rw.acquire_read()
++        _tls.mode = "r"
