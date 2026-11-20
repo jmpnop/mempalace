@@ -1,0 +1,6 @@
+# test-mine material copied from a local checkout ($MINE_SRC), run logs and probe lists stay local
+*src/
+*.out
+*.log
+probes.txt
+__pycache__/
