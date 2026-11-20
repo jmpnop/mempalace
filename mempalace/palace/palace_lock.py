@@ -103,8 +103,16 @@ def _validate_palace_fts5_after_mine(
     # which on Windows keeps the sqlite file mmap'd.
     _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
 
-    errors = sqlite_integrity_errors(palace_path)
+    # The check only reads, through its own read-only sqlite3 connection, and on
+    # a multi-GB palace it runs for minutes; a hub serving this mine lets other
+    # readers run meanwhile instead of making every request wait for it.
+    with mine_shared_phase() as shared:
+        errors = sqlite_integrity_errors(palace_path)
     if errors:
+        if shared:
+            # Readers that ran during the check may have reopened the client;
+            # the heal rewrites the index through raw sqlite, so close it again.
+            _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
         # Not the default print: this runs inside the MCP server process too
         # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
         # transport -- a stray print() here would corrupt the protocol stream

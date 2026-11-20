@@ -343,3 +343,37 @@ def mine_yield_point() -> bool:
     if fn is None:
         return False
     return bool(fn())
+
+
+# Set per thread by a host that serializes a whole mine behind its own lock
+# (the HTTP hub) and can hold that lock shared during a read-only stretch.
+_MINE_SHARE = threading.local()
+
+
+@contextlib.contextmanager
+def mine_share_hook(factory):
+    """Use ``factory()`` as the context manager for every :func:`mine_shared_phase` in this thread."""
+    previous = getattr(_MINE_SHARE, "factory", None)
+    _MINE_SHARE.factory = factory
+    try:
+        yield
+    finally:
+        _MINE_SHARE.factory = previous
+
+
+@contextlib.contextmanager
+def mine_shared_phase():
+    """Mark a stretch of a mine that reads the palace but writes nothing.
+
+    A host that serializes the mine may let other readers run alongside it
+    (no other writer runs until the stretch ends). A no-op unless
+    :func:`mine_share_hook` is active in this thread. Yields True when readers
+    may have run; they can close and reopen backend handles, so the miner must
+    not reuse a collection it opened before the stretch without reopening it.
+    """
+    factory = getattr(_MINE_SHARE, "factory", None)
+    if factory is None:
+        yield False
+        return
+    with factory() as shared:
+        yield bool(shared)

@@ -742,6 +742,89 @@ class TestRWLockYield:
         lock.release_read()
 
 
+class TestRWLockWriteDowngraded:
+    """_RWLock.write_downgraded: a writer's read-only stretch lets readers in."""
+
+    @staticmethod
+    def _in_thread(fn):
+        thread = threading.Thread(target=fn, daemon=True)
+        thread.start()
+        return thread
+
+    def test_reader_runs_during_the_body_and_the_writer_holds_it_again_after(self):
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        entered = threading.Event()
+        with lock.write_downgraded() as shared:
+            assert shared is True
+            self._in_thread(lambda: (lock.acquire_read(), entered.set(), lock.release_read()))
+            assert entered.wait(timeout=2), "a reader could not enter during the read-only stretch"
+        assert lock.owns_write()
+        blocked = threading.Event()
+        self._in_thread(lambda: (lock.acquire_read(), blocked.set(), lock.release_read()))
+        assert not blocked.wait(timeout=0.2), "readers must wait again once the writer is back"
+        lock.release_write()
+        assert blocked.wait(timeout=2)
+
+    def test_reader_enters_ahead_of_a_queued_writer_who_waits_for_the_body(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+        with lock.write_downgraded():
+            self._in_thread(
+                lambda: (lock.acquire_write(), order.append("other writer"), lock.release_write())
+            )
+            time.sleep(0.1)  # the other writer is now queued
+            entered = threading.Event()
+            self._in_thread(lambda: (lock.acquire_read(), entered.set(), lock.release_read()))
+            assert entered.wait(timeout=2), (
+                "the queued writer kept readers out of the shared stretch"
+            )
+            time.sleep(0.1)
+            assert order == [], "another writer ran during the read-only stretch"
+            order.append("body done")
+        # Leaving the body competes with the queued writer like any writer would;
+        # either order is fine, but both must complete without deadlock.
+        lock.release_write()
+        deadline = time.monotonic() + 2
+        while "other writer" not in order and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert order[0] == "body done" and "other writer" in order
+
+    def test_no_op_for_a_thread_not_holding_the_write_lock(self):
+        lock = mcp._RWLock()
+        with lock.write_downgraded() as shared:
+            assert shared is False
+        assert not lock._writer and lock._readers == 0
+        lock.acquire_write()
+        result = []
+
+        def stranger():
+            with lock.write_downgraded() as shared:
+                result.append(shared)
+
+        self._in_thread(stranger).join(timeout=2)
+        assert result == [False]
+        assert lock.owns_write()
+        lock.release_write()
+
+    def test_mine_shared_phase_uses_the_hook_and_is_a_no_op_without_one(self):
+        from mempalace.palace import mine_share_hook, mine_shared_phase
+
+        with mine_shared_phase() as shared:
+            assert shared is False
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        entered = threading.Event()
+        with mine_share_hook(lock.write_downgraded):
+            with mine_shared_phase() as shared:
+                assert shared is True
+                self._in_thread(lambda: (lock.acquire_read(), entered.set(), lock.release_read()))
+                assert entered.wait(timeout=2)
+        assert lock.owns_write()
+        lock.release_write()
+
+
 def test_healthz_ok(http_server):
     port, _ = http_server
     status, body = _get(port, "/healthz")

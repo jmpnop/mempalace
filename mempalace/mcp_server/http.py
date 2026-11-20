@@ -23,12 +23,21 @@ class _RWLock:
         self._waiting_readers = 0
         # True while a yielding writer lets queued readers in (yield_write).
         self._handoff = False
+        # True while a writer holds its lock shared instead (write_downgraded):
+        # readers enter even ahead of a queued writer, which waits for the end.
+        self._shared_phase = False
+
+    def _readers_admitted(self) -> bool:
+        """Whether a new reader may enter now (caller holds ``_cond``)."""
+        return not self._writer and (
+            not self._waiting_writers or self._handoff or self._shared_phase
+        )
 
     def acquire_read(self) -> None:
         with self._cond:
             self._waiting_readers += 1
             try:
-                while self._writer or (self._waiting_writers and not self._handoff):
+                while not self._readers_admitted():
                     self._cond.wait()
             finally:
                 self._waiting_readers -= 1
@@ -39,7 +48,7 @@ class _RWLock:
     def try_acquire_read(self) -> bool:
         """Take the read side only if that needs no wait."""
         with self._cond:
-            if self._writer or (self._waiting_writers and not self._handoff):
+            if not self._readers_admitted():
                 return False
             self._readers += 1
             return True
@@ -107,6 +116,46 @@ class _RWLock:
             finally:
                 self._waiting_writers -= 1
             return True
+
+    @contextlib.contextmanager
+    def write_downgraded(self):
+        """Hold a held write lock shared for the body, then take it back exclusively.
+
+        For a writer with a long read-only stretch, a mine's post-write
+        integrity check: readers run alongside it, even ahead of a queued
+        writer, and no other writer runs until the body ends. Yields True when
+        the lock was downgraded; False (and changes nothing) when the calling
+        thread does not hold the write lock. After a True body, backend handles
+        the caller holds may have been closed by a reader, as after
+        :meth:`yield_write`.
+        """
+        with self._cond:
+            if not self._writer or self._writer_ident != threading.get_ident():
+                owned = False
+            else:
+                owned = True
+                self._writer = False
+                self._writer_ident = None
+                self._readers += 1
+                self._shared_phase = True
+                self._cond.notify_all()
+        if not owned:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with self._cond:
+                self._shared_phase = False
+                self._readers -= 1
+                self._waiting_writers += 1
+                try:
+                    while self._writer or self._readers:
+                        self._cond.wait()
+                    self._writer = True
+                    self._writer_ident = threading.get_ident()
+                finally:
+                    self._waiting_writers -= 1
 
     def read_lock(self):
         lock = self
@@ -692,13 +741,16 @@ def _http_dispatch(request):
     if tool_name in _HTTP_YIELDING_TOOLS:
         # A mine held the exclusive lock for its whole run, so every other
         # palace request, status included, waited for all of it. It still runs
-        # exclusively, but hands the lock to waiting requests between files.
-        from ..palace import mine_yield_hook
+        # exclusively, but hands the lock to waiting requests between files,
+        # and holds it shared during read-only stretches such as the post-write
+        # integrity check (minutes on a multi-GB palace), so reads continue.
+        from ..palace import mine_share_hook, mine_yield_hook
 
         locks = (
             _HTTP_MINE_LOCK,
             _HTTP_REQUEST_LOCK,
             mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
+            mine_share_hook(_HTTP_REQUEST_LOCK.write_downgraded),
         )
         with _http_call_timing(tool_name, "write", locks):
             return handle_request(request)
