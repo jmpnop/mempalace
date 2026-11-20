@@ -289,3 +289,38 @@ heal if needed → release.
 3. Negative controls for gate 1 on the current code.
 4. Live hub: 20-file mine; during the integrity tail every search's lock wait ≤ 5 s and run time ≤ 2× the idle median.
 5. Cleanup + `repair-status` OK.
+
+---
+
+# Revision 3 — 2026-11-20: Design C FAILED adversarial review (round 2)
+
+A (complexity): FAIL. B (interface): FAIL. C (durability): FAIL. Each raised the same critical finding independently.
+- **Searches cannot enter the window (A1/B1/C1, critical).** `ChromaBackend._client()` (chroma.py:3090) and
+  `get_collection()` (~3366) take `palace_db_lock` exclusively on every call, warm cache included; every search opens
+  its collections that way. Under C a search still waits out the scan. Routing those paths through a shared verb
+  re-creates Design A's read→exclusive upgrade (a warm-cache hit can decide under the lock that it must rebuild).
+- **A live Chroma client during the scan is unsafe (A2/C2/C1a).** Chroma writes `chroma.sqlite3` on its own code paths
+  that no `palace_db_lock` wraps (local compaction purges `embeddings_queue`; reads may backfill queued ops; the
+  binding's sqlx pool reaps idle connections, whose real `close()` drops every POSIX lock the process holds on the
+  inode). Today's close-before-check is what keeps all of that out of the scan; C's reopen undid it while the order-only
+  test stayed green (A3/B2).
+- **Two client caches (A4/B1).** The same close drops the MCP session's own client; C reopened only the backend cache.
+- **Lock-mode semantics (B3/A5/A7, B4).** A call that succeeds or raises depending on another thread's window; lock
+  faults escaping `_quick_check_errors` reach the MCP gate as "palace corrupt".
+- **Registry maintenance (A6/B5/C4).** Anchor `discard()` closes raw fds; inside a window it can strip the scanner's locks.
+- **Exit liveness, fork, gates (C3, C7/B9, C5).** No admission rule at exit; new lock state not reset after fork; the
+  proposed gates could not see torn reads or lock drops (missing gates G1–G7 listed in the C report).
+- **B6.** If concurrent readers were safe in the window they would be safe always — the window adds states, not safety;
+  the unexplored direction is to scan a snapshot instead of the live file.
+
+## Conclusion of rounds 1–2
+The scan cannot share the live file — not from another process (B: foreign SHARED blocks commits; child failures read
+as corruption), not in-process (C: every search is exclusive, and a live Chroma writes outside the lock). Next
+direction (Design D, to be designed and reviewed before code): **check an O(1) filesystem clone of the database**,
+taken under the existing exclusive section with the client closed exactly as today; release; `quick_check` the clone
+with no lock (nothing else ever opens it); heal under the exclusive lock only if the clone's verdict is bad.
+Points to establish first: (1) consistency of the clone against *other processes* — hold a SQLite SHARED read
+transaction across the clone so no external commit is mid-flight (rollback), clone `-wal` alongside for WAL palaces and
+rely on WAL checksum recovery on the clone; (2) clone support (APFS `clonefile`, Linux `FICLONE` on Btrfs/XFS, ReFS
+block cloning) and fallback to today's behaviour where unsupported; (3) clone cost and the copy-on-write cost of later
+writes; (4) verdict equivalence with a live-file check; (5) clean-up on crash (a stale clone in a known directory).
