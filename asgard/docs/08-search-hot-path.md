@@ -1,8 +1,8 @@
 # 08 — Search hot path: wing names, capacity verdict reuse, empty-scope closet query
 
 **Status:** implemented (`877cd3e5`, tests `5ded2488`), deployed on asgard 2026-11-21 from `711701dc`
-(byte-identical install, patched chromadb bindings `2fedfa99…` reinstalled). Gates G1–G7, G12, G8, G9, G10 met;
-G10p (live py-spy profile) is recorded below when taken.
+(byte-identical install, patched chromadb bindings `2fedfa99…` reinstalled). All 14 gates met (G1–G7, G12, G8,
+G9, G10, G10p, G11).
 **Design:** [`../designs/search-hot-path.DESIGN.md`](../designs/search-hot-path.DESIGN.md) (revision 4, three
 adversarial review rounds). **Gates:** [`../gates/search-hot-path/`](../gates/search-hot-path/) (`GATES.md` before
 the deploy, `GATES-deploy.md` after it, in run order).
@@ -41,6 +41,7 @@ outside the vector query itself, in three places that recompute what has not cha
 | G6 suite | upstream suite green apart from the two failures documented in 06; ruff clean |
 | G8 deploy | installed `mempalace/` equals the fork tree; bindings `2fedfa99…`; `/healthz` 200 (14 s after bootstrap) |
 | G9 frozen + live | clone of the live palace in 1 attempt (read transaction held 0.063 s); `quick_check` ok; both capacity verdicts "ok"; BASE = FORK for the six profiled queries; live hub results equal to the frozen FORK results (strict check: no row inserted since the clone) |
+| G10p live profile | py-spy at 50 Hz across 6 searches on the idle hub (145,296 samples): `sqlite_wing_names` 0.002 % of samples, `_hnsw_capacity_status_uncached` 0 samples and no probe line (verdict reused); hub run time 27.8 s for the six (85.6 s in the profile that started this work), of which the vector query 14.4 s and the closet full-text query 10.2 s |
 | G10 live probes | 6 searches ≥ 40 s apart: 3 probe lines, all `reason=fingerprint`, over 4 recorded fingerprint changes (allowed 5); the hub's first probe at start-up logged `reason=first-call` |
 
 The six profiled queries through the live hub (client-side seconds, `mempalace-mcp` proxy), idle hub:
