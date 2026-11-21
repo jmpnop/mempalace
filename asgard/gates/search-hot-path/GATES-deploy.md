@@ -6,6 +6,9 @@ Scope: the gates of GATES.md that can only pass on the deployed hub, in run orde
 live probe count while the restarted hub still has its first capacity probes to log, then frozen-state equivalence,
 the live profile and the docs. Run after every gate in GATES.md is met and the hub is redeployed.
 
+Evidence: gate-check records the evidence (it carries machine paths) in a private copy of this ledger and of
+GATES-deploy.md kept outside the repository; the boxes here stay unchecked.
+
 - [ ] G8: deployed hub is byte-identical to the fork commit (installed package tree == git tree for mempalace/) and the
   patched chromadb bindings sha256 is still 2fedfa99…
   CHECK: bash asgard/gates/search-hot-path/g8_deploy_identity.sh

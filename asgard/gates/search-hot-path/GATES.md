@@ -19,6 +19,9 @@ Conventions for every CHECK (enforced inside the scripts, each of which prints i
   is deterministic and is checked on one run per case; cases slower than 20 s per run (scoped union-mode drawer
   reads, 26–61 s) are equality-only.
 
+Evidence: gate-check records the evidence (it carries machine paths) in a private copy of this ledger and of
+GATES-deploy.md kept outside the repository; the boxes here stay unchecked.
+
 - [ ] G1: wing names — on the palace clone FORK's `sqlite_wing_names` equals BASE's list, its first query's plan uses
   `embedding_metadata_string_value`, and the whole call's median time is < 0.05 s; a synthetic palace with int,
   float, bool and string wings gives equal lists too

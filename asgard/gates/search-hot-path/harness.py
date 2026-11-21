@@ -231,12 +231,16 @@ def main() -> None:
     parser.add_argument("--value", default="")
     parser.add_argument("--duration", type=float, default=120.0)
     args = parser.parse_args()
+    # Importing mempalace.mcp_server (search mode) points fd 1 at stderr for MCP stdio protection, so the
+    # JSON goes to a duplicate of the real stdout taken before any mempalace import.
+    out = os.fdopen(os.dup(1), "w")
     _isolate(args.tree, args.palace, args.scratch)
     result = globals()[f"mode_{args.mode}"](args)
     import mempalace
 
     result["mempalace_file"] = mempalace.__file__
-    json.dump(result, sys.stdout, sort_keys=True)
+    json.dump(result, out, sort_keys=True)
+    out.close()
 
 
 if __name__ == "__main__":
