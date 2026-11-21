@@ -123,9 +123,9 @@ def _outcomes() -> dict:
 
 @pytest.fixture(autouse=True)
 def _fresh_outcomes():
-    counter = getattr(cs, "SCOPE_WALK_OUTCOMES", None)
-    if counter is not None:
-        counter.clear()
+    reset = getattr(cs, "reset_scope_walk_stats", None)
+    if reset is not None:
+        reset()
     yield
 
 

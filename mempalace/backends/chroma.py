@@ -9,6 +9,7 @@ import pickle
 import shlex
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import warnings
@@ -1142,12 +1143,21 @@ def _hnsw_metadata_age_seconds(palace_path: str, segment_id: str) -> Optional[fl
 
 
 # Probe verdicts keyed by ``(palace_path, collection_name)``; each value is
-# ``(fingerprint, segment_id, status, probed_at)``. Written as one tuple
+# ``(fingerprint, segment_id, status, probed_at, window_s, flips_at)``:
+# ``probed_at`` is monotonic, ``window_s`` how long the verdict may be reused
+# from then, and ``flips_at`` the wall-clock moment an "ok" verdict would turn
+# "diverged" with no file changing (``None`` when it cannot). Written as one tuple
 # assignment, so a concurrent reader either sees the previous entry or the new
 # one, never a half-updated pair. Two threads that miss together simply both
 # run the probe and the last writer wins — a benign race, and cheaper than
 # serializing every reader behind a lock.
-_capacity_cache: dict[tuple[str, str], tuple[tuple, Optional[str], dict, float]] = {}
+_capacity_cache: dict[
+    tuple[str, str], tuple[tuple, Optional[str], dict, float, float, Optional[float]]
+] = {}
+
+# Keys probed at least once in this process, so a probe with no cached entry
+# can say whether it is the first one or follows an uncached verdict or reset.
+_capacity_probed_keys: set[tuple[str, str]] = set()
 
 # Bumped by every :func:`reset_hnsw_capacity_cache`. A probe reads it before
 # running and refuses to store its verdict if it changed meanwhile, so a probe
@@ -1160,13 +1170,60 @@ _capacity_cache_generation = 0
 # (benchmarks, batch tooling) cannot grow it without limit.
 _CAPACITY_CACHE_MAX_ENTRIES = 32
 
-# Ceiling on how long one verdict may be reused, as a backstop for filesystems
-# whose timestamps are too coarse to notice a quick rewrite: FAT32 stores mtime
-# at 2 s granularity, exFAT at 10 ms, and a write that lands inside existing
-# sqlite pages need not change the file size either. On ext4/APFS/NTFS the
-# signature already catches every write, so this ceiling never fires in
-# practice. It bounds the worst case; it is not the freshness mechanism.
+# How long one verdict may be reused on a filesystem that is not known to
+# change a file's signature on every write: FAT32 stores mtime at 2 s
+# granularity, exFAT at 10 ms, HFS+ at 1 s, and a write that lands inside
+# existing sqlite pages need not change the file size either, so there the
+# signature can miss a quick rewrite and this window bounds the staleness. It
+# is also the window for a verdict without an HNSW element count, which reads
+# files the signature does not cover. Searches more than this far apart re-run
+# the probe (2-3 s on a million-drawer palace).
 _CAPACITY_CACHE_MAX_AGE_SECONDS = 10.0
+
+# The reuse window on a filesystem in :data:`_SIGNATURE_EXACT_FS_TYPES`, whose
+# nanosecond timestamps change on every write (measured on APFS: no repeated
+# signature in 2,000 consecutive sqlite commits; HFS+ and exFAT repeated in
+# 1,998). There the signature is the freshness mechanism and this only bounds
+# how long a verdict lives without a write.
+_CAPACITY_REUSE_WINDOW_SECONDS = 3600.0
+_SIGNATURE_EXACT_FS_TYPES = frozenset({"apfs"})
+
+_libc_handle = None
+
+
+def _fs_type(path: str, libc=None) -> str:
+    """The filesystem type name of ``path`` (``"apfs"``, ``"hfs"``, ``"exfat"``, ...).
+
+    ``""`` when it cannot be read or the platform has no such name: only macOS
+    reports one here, so every other platform keeps the short reuse window.
+    The libc symbol is chosen by presence, not by architecture: on x86_64 the
+    plain ``statfs`` is the legacy 32-bit-inode ABI and leaves the name empty,
+    so ``statfs$INODE64`` is preferred where libc has it (also under Rosetta);
+    arm64 has only ``statfs``. ``libc`` is a test seam.
+    """
+    global _libc_handle
+    try:
+        if libc is None:
+            if sys.platform != "darwin":
+                return ""
+            if _libc_handle is None:
+                import ctypes
+
+                _libc_handle = ctypes.CDLL(None)
+            libc = _libc_handle
+        statfs = getattr(libc, "statfs$INODE64", None) or getattr(libc, "statfs", None)
+        if statfs is None:
+            return ""
+        import ctypes
+
+        # struct statfs (64-bit inode layout): 2168 bytes, f_fstypename[16] at
+        # offset 72. A fresh buffer per call: callers may run on several threads.
+        buf = ctypes.create_string_buffer(2168)
+        if statfs(os.fsencode(path), buf) != 0:
+            return ""
+        return buf.raw[72:88].split(b"\0", 1)[0].decode("ascii", "replace")
+    except Exception:
+        return ""
 
 
 def _stat_signature(path: str) -> tuple[int, int, int]:
@@ -1297,26 +1354,43 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
     is ``None`` from a locked database, or there is no palace yet) is returned
     but never cached, so a transient failure cannot pin a false reading.
 
-    Freshness comes from an ``(inode, mtime_ns, size)`` signature rather than a
-    wall-clock TTL, so an external writer — ``mempalace repair``, a peer mine,
-    another process — invalidates the verdict as soon as it touches the files,
-    instead of leaving the divergence guard blind for a fixed window.
-    ``_CAPACITY_CACHE_MAX_AGE_SECONDS`` caps how long one verdict may be
-    reused, but only as a backstop for filesystems with coarse timestamps; the
-    signature is what makes the verdict fresh.
+    A cached verdict is reused while three things hold. Its files are
+    unchanged: an ``(inode, mtime_ns, size)`` signature of sqlite, the segment
+    pickle and header, so an external writer — ``mempalace repair``, a peer
+    mine, another process — invalidates it as soon as it touches them. Its
+    reuse window has not elapsed (monotonic clock):
+    ``_CAPACITY_REUSE_WINDOW_SECONDS`` on a filesystem whose timestamps change
+    on every write (today APFS), otherwise, and for a verdict without an HNSW
+    element count, ``_CAPACITY_CACHE_MAX_AGE_SECONDS``. And, for an "ok"
+    verdict with a divergence and a pickle younger than the
+    ``_HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS`` grace — which turns
+    "diverged" when the grace ends, with no file changing — the end of the
+    grace has not passed (wall clock, the clock the probe's age test uses). A
+    reused verdict is the probe's dict, copied: ``hnsw_metadata_age_seconds``
+    is the pickle's age when it was probed. Each probe that runs logs one INFO
+    line naming why.
 
     Unlike :meth:`ChromaBackend._client`, which tolerates a 0.01 s mtime
     epsilon to avoid rebuilding an expensive client, this compares exactly:
-    re-running the probe costs milliseconds, whereas serving one stale verdict
-    can route a query into a diverged segment.
+    re-running the probe costs seconds on a large palace, but serving one
+    stale verdict can route a query into a diverged segment.
     """
     key = (palace_path, collection_name)
     cached = _capacity_cache.get(key)
-    if cached is not None:
-        fingerprint, cached_segment, status, probed_at = cached
-        if time.monotonic() - probed_at <= _CAPACITY_CACHE_MAX_AGE_SECONDS:
-            if _capacity_fingerprint(palace_path, cached_segment) == fingerprint:
-                return dict(status)
+    if cached is None:
+        reason = "uncached" if key in _capacity_probed_keys else "first-call"
+    else:
+        fingerprint, cached_segment, status, probed_at, window_s, flips_at = cached
+        if time.monotonic() - probed_at > window_s:
+            reason = "window"
+        elif flips_at is not None and time.time() >= flips_at:
+            reason = "deadline"
+        elif _capacity_fingerprint(palace_path, cached_segment) != fingerprint:
+            reason = "fingerprint"
+        else:
+            return dict(status)
+    _capacity_probed_keys.add(key)
+    logger.info("hnsw capacity probe: %s reason=%s", collection_name, reason)
 
     generation = _capacity_cache_generation
     # Snapshot the files the probe is about to read, before it reads them, and
@@ -1343,8 +1417,38 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
     if cacheable:
         if len(_capacity_cache) >= _CAPACITY_CACHE_MAX_ENTRIES:
             _capacity_cache.clear()
-        _capacity_cache[key] = (after, segment_id, dict(out), time.monotonic())
+        window_s, flips_at = _capacity_reuse_terms(palace_path, out, after)
+        _capacity_cache[key] = (after, segment_id, dict(out), time.monotonic(), window_s, flips_at)
     return out
+
+
+def _capacity_reuse_terms(palace_path: str, out: dict, fingerprint: tuple) -> tuple:
+    """``(window_s, flips_at)`` for a verdict about to be cached.
+
+    Uses only the public verdict and the fingerprint the probe was checked
+    against. ``flips_at`` covers a superset of the verdicts that can turn
+    "diverged" with time alone: whether the sync threshold is explicit is not
+    in the verdict, so an explicit-threshold palace with a young pickle also
+    re-probes once when the grace ends — one probe, never a wrong answer.
+    """
+    if out.get("hnsw_count") is None:
+        window_s = _CAPACITY_CACHE_MAX_AGE_SECONDS
+    elif _fs_type(palace_path) in _SIGNATURE_EXACT_FS_TYPES:
+        window_s = _CAPACITY_REUSE_WINDOW_SECONDS
+    else:
+        window_s = _CAPACITY_CACHE_MAX_AGE_SECONDS
+    age = out.get("hnsw_metadata_age_seconds")
+    pickle_mtime_ns = fingerprint[1][1]
+    flips_at = None
+    if (
+        out.get("status") == "ok"
+        and (out.get("divergence") or 0) > 0
+        and age is not None
+        and age < _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS
+        and pickle_mtime_ns
+    ):
+        flips_at = pickle_mtime_ns / 1e9 + _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS
+    return window_s, flips_at
 
 
 def _hnsw_capacity_status_uncached(

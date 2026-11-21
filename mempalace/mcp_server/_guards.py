@@ -1124,8 +1124,8 @@ def _force_chroma_cache_reset() -> None:
     # This runs on the transient-index-error retry path, which drops caches to
     # re-observe the palace after a transient index error. The capacity verdict
     # is another cached view of that same palace, so it must be dropped too, or
-    # the retry could be answered from the pre-error verdict (its 10 s ceiling
-    # outlasts the 2 s retry sleep).
+    # the retry could be answered from the pre-error verdict (its reuse window,
+    # 10 s or an hour on APFS, outlasts the 2 s retry sleep).
     reset_hnsw_capacity_cache()
     try:
         from ..palace import get_backend_for_palace

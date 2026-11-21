@@ -71,8 +71,8 @@ Allow-list: `{"apfs"}` (measured: 0 repeated signatures in 2,000 commits; HFS+ a
 10 s). Linux and other platforms keep today's 10 s — no change for them.
 
 ### Logging
-Every uncached probe logs one INFO line `hnsw capacity probe: <collection> reason=<first-call|fingerprint|window|
-deadline|uncacheable>` (a few per hour on an idle asgard hub). G10 counts these lines.
+Every uncached probe logs one INFO line `hnsw capacity probe: <collection> reason=<first-call|uncached|fingerprint|window|
+deadline>` (a few per hour on an idle asgard hub). G10 counts these lines.
 
 ### Changes in code and tests (`backends/chroma.py`, `mcp_server/_guards.py`, `tests/test_hnsw_capacity.py`)
 - cache tuple gains `flips_at: Optional[float]` and `window_s: float`; annotation and comment updated;

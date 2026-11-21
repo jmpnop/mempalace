@@ -10,9 +10,10 @@ their stored form in :func:`_decoded_rows`.
 """
 
 import contextlib
+import logging
 import os
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Iterable, Iterator, Optional
 
 from ..lexical import tokenize
@@ -20,6 +21,8 @@ from ..stored_text import FLAG, decode_record, decode_value, encode_filter, enco
 from ..timeutil import recency_floor, recency_key
 from ._filters import matches_where
 from ._inproc_sqlite import open_reader as open_palace_reader
+
+logger = logging.getLogger(__name__)
 
 
 class MetadataRecoveryPending(sqlite3.OperationalError):
@@ -444,6 +447,96 @@ def _newest_row_ids(
         return newest("e.id DESC")
 
 
+# How many ``(key, string_value)`` index entries one scope walk may visit
+# before it gives up and lets the full-text query run. A full walk costs about
+# 0.8-1.6 us per entry, so the limit bounds a walk near 16-32 ms, against the
+# ~1 s scoped trigram query a skip saves.
+_SCOPE_PROBE_LIMIT = 20_000
+
+# Outcomes of the scope walk in this process: ``skip`` (the full-text query
+# was not needed), ``hit``, ``limit`` and ``error`` (it ran as before).
+SCOPE_WALK_OUTCOMES: Counter = Counter()
+_scope_limits_logged: set = set()
+
+
+def reset_scope_walk_stats() -> None:
+    """Zero :data:`SCOPE_WALK_OUTCOMES` and forget which limits were logged."""
+    SCOPE_WALK_OUTCOMES.clear()
+    _scope_limits_logged.clear()
+
+
+def _scope_walk(conn, collection_name: str, key: str, values: tuple, limit: int) -> str:
+    """``"hit"``, ``"exhausted"`` or ``"limit"`` for one string equality.
+
+    ``"hit"``: some row of ``collection_name`` holds one of ``values`` under
+    ``key``. ``"exhausted"``: every index entry for them was visited and none
+    belongs to the collection. ``"limit"``: ``limit`` entries were visited
+    without a hit, so the answer is unknown. Each is one indexed statement in
+    the caller's autocommit connection; no transaction is opened.
+    """
+    marks = _marks(values)
+    walk = (
+        "SELECT id FROM embedding_metadata"
+        f" WHERE key = ? AND string_value IN ({marks}) AND string_value IS NOT NULL LIMIT ?"
+    )
+    params = (key, *values, limit)
+    found = conn.execute(
+        f"""
+        SELECT EXISTS (
+            SELECT 1 FROM ({walk}) w
+            JOIN embeddings e ON e.id = w.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            WHERE c.name = ?
+        )
+        """,
+        (*params, collection_name),
+    ).fetchone()[0]
+    if found:
+        return "hit"
+    visited = conn.execute(f"SELECT count(*) FROM ({walk})", params).fetchone()[0]
+    return "limit" if visited >= limit else "exhausted"
+
+
+def _scope_is_empty(conn, collection_name: str, where: Optional[dict]) -> bool:
+    """True only when ``where`` provably matches no row of ``collection_name``.
+
+    ``where`` must be string equalities (``$eq``/``$in``/``$and`` of them);
+    any other shape, a walk that reached its limit, or a read error answers
+    ``False``, so the caller runs its query as before. One equality whose walk
+    is exhausted without a hit is enough: an ``$and`` cannot match where one
+    of its terms matches nothing. Records the outcome in
+    :data:`SCOPE_WALK_OUTCOMES`.
+    """
+    equalities = _string_equalities(encode_where(where)) if where else None
+    if not equalities:
+        return False
+    outcome = "hit"
+    try:
+        for key, values in equalities:
+            walked = _scope_walk(conn, collection_name, key, values, _SCOPE_PROBE_LIMIT)
+            if walked == "exhausted":
+                SCOPE_WALK_OUTCOMES["skip"] += 1
+                return True
+            if walked == "limit":
+                outcome = "limit"
+                scope = (collection_name, key, values)
+                if scope not in _scope_limits_logged:
+                    _scope_limits_logged.add(scope)
+                    logger.info(
+                        "scope walk: %s %s=%r reached its limit of %d index entries;"
+                        " the full-text query runs unskipped",
+                        collection_name,
+                        key,
+                        values,
+                        _SCOPE_PROBE_LIMIT,
+                    )
+    except sqlite3.Error:
+        outcome = "error"
+    SCOPE_WALK_OUTCOMES[outcome] += 1
+    return False
+
+
 def sqlite_lexical_rows(
     palace_path: str,
     collection_name: str,
@@ -460,10 +553,20 @@ def sqlite_lexical_rows(
     rows stand in when no query term is three characters long or the
     full-text query fails; a clean miss stays empty. ``[]`` when the database
     is missing or unreadable.
+
+    A ``where`` naming a value that no row of this collection holds can match
+    nothing; that is established first by a bounded index walk in its own
+    statement (:func:`_scope_is_empty`), and the full-text query is then
+    skipped. A walk that reaches its limit or fails falls back to the full
+    query. No transaction spans the walk and the query: holding one across
+    the query and the decode would block writers in other processes for as
+    long as both take.
     """
     tokens = [t for t in tokenize(query) if len(t) >= 3]
 
     def read(conn):
+        if _scope_is_empty(conn, collection_name, where):
+            return []
         row_ids: list[int] = []
         recency = not tokens
         if tokens:
@@ -739,12 +842,18 @@ def sqlite_wing_names(palace_path: str, limit: int = 10_000) -> Optional[list[st
     """Every distinct string ``wing`` in ``chroma.sqlite3``, or ``None``.
 
     Steps through the ``(key, string_value)`` index one value at a time, so
-    the read costs one index seek per wing, not a scan of every drawer. Spans
-    every collection in the database: callers use it to recognise spellings
-    of a wing, not to count drawers. ``None`` when the database is missing
-    or the read fails.
+    the read costs one index seek per wing, not a scan of every drawer. Every
+    query names ``string_value IS NOT NULL``: the index is partial, and
+    without that condition SQLite cannot use it and scans the whole metadata
+    table instead (seconds on a million-drawer palace). ``MIN`` ignores NULLs,
+    so the condition never changes the answer. Spans every collection in the
+    database: callers use it to recognise spellings of a wing, not to count
+    drawers. ``None`` when the database is missing or the read fails.
     """
-    sql = "SELECT MIN(string_value) FROM embedding_metadata WHERE key = 'wing'"
+    sql = (
+        "SELECT MIN(string_value) FROM embedding_metadata"
+        " WHERE key = 'wing' AND string_value IS NOT NULL"
+    )
 
     def read(conn):
         names: list[str] = []
