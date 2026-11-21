@@ -16,6 +16,7 @@ of v3.12.0 are separate commits, each with its own document; the hub runs a byte
 | 05 | still open on 3.12.0: post-mine quick_check blocks for ~10 min; searches 13–27 s; Rust-port plan | — | [docs/05](docs/05-open-issues.md) |
 | 06 | the post-mine check blocks readers on the hub lock, then on `palace_db_lock` | commit `ef89c2cb` (hub lock: shared phase) deployed; `palace_db_lock` still serializes readers — open | [docs/06](docs/06-post-mine-check-and-palace-db-lock.md) |
 | 07 | which code would gain from a Rust port (measured on a palace clone) | analysis only: nearly all hot time is native SQLite/chromadb; one pure-Python loop qualifies | [docs/07](docs/07-rust-port-analysis.md) |
+| 08 | searches spent 76.5 % of their time recomputing wing names, the capacity verdict and empty-scope closet queries | commits `877cd3e5` + tests `5ded2488`, deployed 2026-11-21; output identical (G4, G5, G9) | [docs/08](docs/08-search-hot-path.md) |
 
 ## Layout
 - `docs/` — one document per change: symptom, measurements, cause, change, evidence, status.

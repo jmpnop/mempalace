@@ -4,7 +4,7 @@ Upstream `backends/_inproc_sqlite.py` enables OFD locks only on Linux and states
 back to a helper process and "keeps the cross-process lock drop". On current macOS:
 
 - SDK `sys/fcntl.h`: `F_OFD_SETLK 90`, `F_OFD_SETLKW 91`, `F_OFD_GETLK 92`, `F_OFD_SETLKWTIMEOUT 93`
-  (Xcode and Command Line Tools SDKs); `fcntl(2)` documents OFD locks; Python 3.13's `fcntl` exports
+  (the full developer IDE SDK and the Command Line Tools SDK); `fcntl(2)` documents OFD locks; Python 3.13's `fcntl` exports
   `F_OFD_GETLK`, `F_OFD_SETLK`, `F_OFD_SETLKW`.
 - `macos_ofd_probe.py` (Darwin `struct flock` layout `qqihh`: start, len, pid, type, whence) measured:
 
