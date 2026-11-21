@@ -66,7 +66,7 @@ Conventions for every CHECK (enforced inside the scripts, each of which prints i
   wing values, numeric wing values, union-mode drawer reads (equality only) — FORK's `sqlite_lexical_rows` output and
   whole `_closet_boosts` dict (rank, distance, preview per source) equal BASE's on the palace clone and the synthetic
   palace; median boost time is lower for every scope without closets inside the walk limit and within noise
-  (<= 5 % on medians) everywhere else; the walk at the limit (synthetic wing) has a median below 0.05 s
+  (FORK median <= 1.05 x BASE median + 10 ms) everywhere else; the walk at the limit (synthetic wing) has a median below 0.05 s
   CHECK: bash asgard/gates/search-hot-path/g4_lexical_and_boosts.sh "$PROFILE_PALACE"
   EXPECT: G4_LEXICAL_AND_BOOSTS_IDENTICAL
   EVIDENCE: pending

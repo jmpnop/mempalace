@@ -107,7 +107,8 @@ def mode_lexical(args) -> dict:
         )
         entry = {"name": case["name"], "rows": _jsonable(rows)}
         if case.get("boosts", True) and collection == "mempalace_closets":
-            def boosts():
+
+            def boosts(case=case, where=where):
                 return searcher._closet_boosts(
                     closets, query=case["query"], n_results=case.get("n_results", 5), where=where
                 )
@@ -140,7 +141,13 @@ def mode_search(args) -> dict:
     for case in _cases(args.cases):
         kwargs = {k: v for k, v in case.items() if k not in ("name",)}
         result = mcp_server.tool_search(**kwargs)
-        out.append({"name": case["name"], "result": _strip_timing(_jsonable(result))})
+        out.append(
+            {
+                "name": case["name"],
+                "result": _strip_timing(_jsonable(result)),
+                "vector_disabled": bool(getattr(mcp_server, "_vector_disabled", False)),
+            }
+        )
     return {"cases": out}
 
 
