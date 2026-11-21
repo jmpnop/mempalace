@@ -169,15 +169,67 @@ def mode_walk_limit(args) -> dict:
     return {"result": result, "times": times, "median": statistics.median(times)}
 
 
+def mode_mix(args) -> dict:
+    """Repeat the G12 search mix for ``--duration`` seconds; report what ran."""
+    import mempalace.searcher as searcher
+    from mempalace.backends import chroma_sqlite as cs
+
+    closets = searcher.get_closets_collection(args.palace, create=False, read_only=True)
+    mix = _cases(args.cases)
+    ran, deadline = [], time.monotonic() + args.duration
+    while time.monotonic() < deadline:
+        for case in mix:
+            t0 = time.perf_counter()
+            if case.get("collection") == "mempalace_drawers":
+                cs.sqlite_lexical_rows(
+                    args.palace,
+                    "mempalace_drawers",
+                    case["query"],
+                    where=case.get("where"),
+                    limit=case.get("limit", 15),
+                )
+            else:
+                searcher._closet_boosts(
+                    closets, query=case["query"], n_results=5, where=case.get("where")
+                )
+            ran.append((case["name"], time.perf_counter() - t0))
+            if time.monotonic() >= deadline:
+                break
+    return {"ran": ran}
+
+
+def mode_capacity(args) -> dict:
+    """The capacity verdict for both collections and each VECTOR segment's pickle count."""
+    import sqlite3
+
+    from mempalace.backends import chroma as chroma_mod
+
+    conn = sqlite3.connect(f"file:{os.path.join(args.palace, 'chroma.sqlite3')}?mode=ro", uri=True)
+    try:
+        segments = [r[0] for r in conn.execute("SELECT id FROM segments WHERE scope = 'VECTOR'")]
+    finally:
+        conn.close()
+    return {
+        "status": {
+            name: _jsonable(chroma_mod.hnsw_capacity_status(args.palace, name))
+            for name in ("mempalace_drawers", "mempalace_closets")
+        },
+        "pickle_counts": {s: chroma_mod._hnsw_element_count(args.palace, s) for s in segments},
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["wing_names", "lexical", "search", "walk_limit"])
+    parser.add_argument(
+        "mode", choices=["wing_names", "lexical", "search", "walk_limit", "mix", "capacity"]
+    )
     parser.add_argument("--tree", required=True)
     parser.add_argument("--palace", required=True)
     parser.add_argument("--scratch", required=True)
     parser.add_argument("--cases")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--value", default="")
+    parser.add_argument("--duration", type=float, default=120.0)
     args = parser.parse_args()
     _isolate(args.tree, args.palace, args.scratch)
     result = globals()[f"mode_{args.mode}"](args)

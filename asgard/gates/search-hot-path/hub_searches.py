@@ -72,20 +72,25 @@ def run_all():
     return out
 
 
-mode, d = sys.argv[1], sys.argv[2]
-os.makedirs(d, exist_ok=True)
-res = run_all()
-for r in res:
-    print(f"{r['seconds']:7.2f}s  {r['args']['query']!r}  {len(r['ids'])} ids")
-if mode == "baseline":
-    json.dump(res, open(os.path.join(d, "baseline.json"), "w"), indent=1)
-    print("BASELINE_RECORDED")
-else:
-    json.dump(res, open(os.path.join(d, "after.json"), "w"), indent=1)
-    base = json.load(open(os.path.join(d, "baseline.json")))
-    bad = [b["args"]["query"] for b, a in zip(base, res) if b["ids"] != a["ids"]]
-    print(
-        "total before %.1fs after %.1fs"
-        % (sum(b["seconds"] for b in base), sum(a["seconds"] for a in res))
-    )
-    print("DIFFERENT: %s" % bad if bad else "SEARCH_RESULTS_IDENTICAL")
+def main():
+    mode, d = sys.argv[1], sys.argv[2]
+    os.makedirs(d, exist_ok=True)
+    res = run_all()
+    for r in res:
+        print(f"{r['seconds']:7.2f}s  {r['args']['query']!r}  {len(r['ids'])} ids")
+    if mode == "baseline":
+        json.dump(res, open(os.path.join(d, "baseline.json"), "w"), indent=1)
+        print("BASELINE_RECORDED")
+    else:
+        json.dump(res, open(os.path.join(d, "after.json"), "w"), indent=1)
+        base = json.load(open(os.path.join(d, "baseline.json")))
+        bad = [b["args"]["query"] for b, a in zip(base, res) if b["ids"] != a["ids"]]
+        print(
+            "total before %.1fs after %.1fs"
+            % (sum(b["seconds"] for b in base), sum(a["seconds"] for a in res))
+        )
+        print("DIFFERENT: %s" % bad if bad else "SEARCH_RESULTS_IDENTICAL")
+
+
+if __name__ == "__main__":
+    main()
