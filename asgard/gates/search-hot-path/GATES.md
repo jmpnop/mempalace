@@ -30,7 +30,7 @@ Conventions for every CHECK (enforced inside the scripts, each of which prints i
   pickle mtime + 300 s and re-probed after it; an explicit-threshold verdict with divergence and a pickle older than
   300 s is reused past 10 s on an allow-listed fs; an already-diverged verdict is reused within its window; any
   fingerprint change re-probes at once; a backward wall-clock step does not extend the reuse window; a reused verdict
-  reports the pickle age as of the call; each uncached probe logs one reason line; `_fs_type` selects
+  equals the probe's dict; each uncached probe logs one reason line; `_fs_type` selects
   `statfs$INODE64` when present and `statfs` otherwise; empty-scope skip returns `[]` without running a MATCH; a walk
   at the limit falls back and counts `limit`; a walk error falls back and counts `error`; an `$and` with one exhausted
   equality skips; an `$in` skips only when the walk over all its values is exhausted with no hit
@@ -48,7 +48,7 @@ Conventions for every CHECK (enforced inside the scripts, each of which prints i
 - [ ] G3: negative control — the new-behaviour tests fail on BASE, each by `AssertionError` (tests reach new names
   through `getattr(..., default)` and `monkeypatch.setattr(..., raising=False)`, so no failure is an import or
   attribute error), and pass on FORK: allow-listed reuse past 10 s; explicit-threshold old-pickle reuse; young-pickle
-  reuse before the deadline; age as of the call; reason log line; wing-name first-query plan uses the index;
+  reuse before the deadline; reason log line; wing-name first-query plan uses the index;
   empty-scope skip runs no MATCH; limit and error outcomes counted. The behaviour-preserving tests (10 s re-probe off
   the allow-list, `hnsw_count is None` 10 s, fingerprint change, re-probe after the deadline, limit fallback output,
   error fallback output) pass on both. The script prints both lists and the exception type of each BASE failure

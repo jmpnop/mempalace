@@ -54,9 +54,10 @@ window stays monotonic so a backward clock step cannot extend it. `time.monotoni
 (measured); a verdict reused after a sleep is still guarded by the fingerprint and the wall-clock deadline.
 
 ### The age field on a reused verdict
-`hnsw_metadata_age_seconds` is reported at call time, not at probe time: on a hit it is recomputed as
-`time.time() - pickle_mtime_ns / 1e9` from the cached fingerprint (the same file, unchanged). A reused verdict is
-otherwise the probe's dict, copied.
+A reused verdict is the probe's dict, copied: `hnsw_metadata_age_seconds` is the pickle's age **at probe time**, and
+the docstring says so. Recomputing it on a hit was considered and rejected: no consumer reads the field (only
+`tools_read` exposes counts), and identical repeated calls returning identical dicts is pinned by the upstream test
+`test_unchanged_palace_probes_once`. Time-dependence of the verdict itself is handled by the age deadline above.
 
 ### Filesystem allow-list
 `_fs_type(path) -> str` reads `f_fstypename` with `statfs`, called once per stored verdict (microseconds; no cache,
@@ -151,8 +152,8 @@ def _fs_type(path: str) -> str:
 
 # hnsw_capacity_status: "A cached verdict is reused while its files are unchanged, within a reuse window (10 s, or
 # 3600 s on filesystems whose timestamps change on every write — today APFS), and — for an 'ok' verdict with a
-# divergence and a pickle younger than the 300 s grace — until the grace ends. The pickle age is reported as of the
-# call."
+# divergence and a pickle younger than the 300 s grace — until the grace ends. A reused verdict reports the pickle
+# age measured when it was probed."
 
 # sqlite_lexical_rows: "A filter naming a value that no row of this collection holds can match nothing. That is
 # established first, by a bounded index walk in its own statement, and the full-text query is then skipped. A walk
@@ -196,7 +197,8 @@ def _fs_type(path: str) -> str:
     hit";
   - the private `flips_at` channel changed the probe's return shape → deadline from public fields, superset rule;
   - a 2,000 limit has a silent cliff → 20,000 (measured cost), outcome counters and an INFO line on the limit;
-  - the reused dict reported a stale pickle age → recomputed on a hit;
+  - the reused dict reports the pickle age at probe time → documented as such (recomputing would break an upstream
+    equality test and serves no consumer);
   - the fs-type cache keyed by `st_dev` can outlive a remount, and symbol choice by architecture breaks under
     Rosetta → no cache, symbol by presence, fresh buffer;
   - gates: negative control must fail by assertion, a cross-process writer gate, G9 clone retries, `quick_check`
