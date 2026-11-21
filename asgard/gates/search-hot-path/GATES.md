@@ -47,11 +47,15 @@ Conventions for every CHECK (enforced inside the scripts, each of which prints i
 
 - [ ] G3: negative control — the new-behaviour tests fail on BASE, each by `AssertionError` (tests reach new names
   through `getattr(..., default)` and `monkeypatch.setattr(..., raising=False)`, so no failure is an import or
-  attribute error), and pass on FORK: allow-listed reuse past 10 s; explicit-threshold old-pickle reuse; young-pickle
-  reuse before the deadline; reason log line; wing-name first-query plan uses the index;
-  empty-scope skip runs no MATCH; limit and error outcomes counted. The behaviour-preserving tests (10 s re-probe off
-  the allow-list, `hnsw_count is None` 10 s, fingerprint change, re-probe after the deadline, limit fallback output,
-  error fallback output) pass on both. The script prints both lists and the exception type of each BASE failure
+  attribute error), and pass on FORK. New behaviour (14): in `TestCapacityReuseWindow` — allow-listed reuse past
+  10 s, explicit-threshold old-pickle reuse, young-pickle reuse before the grace ends, re-probe the moment the grace
+  ends (BASE reuses for up to 10 s after it), already-diverged reuse, reason log line, `_fs_type` symbol choice,
+  `_fs_type` of a missing path; in `test_chroma_sqlite_scope_walk.py` — empty-scope skip runs no MATCH, `$and` with
+  one exhausted equality skips, limit outcome counted, limit logged once, error outcome counted, wing-name first
+  query uses the index. Behaviour preserved (pass on both): every other test in both files, incl. the 10 s re-probe
+  off the allow-list, `hnsw_count is None` 10 s, backward wall step, fingerprint change, limit and error fallback
+  output, `$in` partial, unevaluable filters, the recency path, wing names without the index. The script prints
+  both lists and the exception type of each BASE failure, and fails if any BASE failure is not an `AssertionError`
   CHECK: bash asgard/gates/search-hot-path/g3_negative_control.sh
   EXPECT: G3_NEGATIVE_CONTROL_OK
   EVIDENCE: pending

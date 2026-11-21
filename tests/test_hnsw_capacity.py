@@ -905,10 +905,15 @@ class TestCapacityProbeCache:
         assert len(runs) == 2, "a quiet palace must be cached again afterwards"
 
     def test_verdict_is_not_reused_past_the_age_ceiling(self, tmp_path, probe_runs, monkeypatch):
-        """Backstop for filesystems whose timestamps are too coarse to notice."""
+        """Backstop for filesystems whose timestamps are too coarse to notice.
+
+        Off the allow-list of filesystems whose timestamps change on every
+        write, the 10 s ceiling is the reuse window.
+        """
         from mempalace.backends import chroma as chroma_mod
 
         self._balanced_palace(tmp_path)
+        monkeypatch.setattr(chroma_mod, "_fs_type", lambda path: "", raising=False)
         clock = [1_000.0]
         monkeypatch.setattr(chroma_mod.time, "monotonic", lambda: clock[0])
 
@@ -1164,6 +1169,210 @@ class TestCapacityProbeCache:
             chroma_mod._hnsw_capacity_status_uncached = real
 
         assert chroma_mod._capacity_cache == {}, "the in-flight probe resurrected a reset entry"
+
+
+class TestCapacityReuseWindow:
+    """How long an unchanged verdict may be reused.
+
+    The fingerprint catches every write on a filesystem whose timestamps change
+    on each write (APFS), so there the verdict is reused for an hour; elsewhere
+    the 10 s ceiling stays. A verdict that turns "diverged" with time alone (an
+    "ok" with a divergence and a pickle younger than the 300 s grace) is reused
+    only until the grace ends. New names are patched with ``raising=False`` so a
+    tree without the change fails these tests by assertion.
+    """
+
+    @pytest.fixture
+    def probe_runs(self, monkeypatch):
+        from mempalace.backends import chroma as chroma_mod
+
+        calls: list[str] = []
+        real = chroma_mod._hnsw_capacity_status_uncached
+
+        def counting(palace_path, collection_name="mempalace_drawers"):
+            calls.append(collection_name)
+            return real(palace_path, collection_name)
+
+        monkeypatch.setattr(chroma_mod, "_hnsw_capacity_status_uncached", counting)
+        return calls
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        from mempalace.backends import chroma as chroma_mod
+
+        now = [5_000.0]
+        monkeypatch.setattr(chroma_mod.time, "monotonic", lambda: now[0])
+        return now
+
+    @staticmethod
+    def _fs(monkeypatch, name):
+        from mempalace.backends import chroma as chroma_mod
+
+        monkeypatch.setattr(chroma_mod, "_fs_type", lambda path: name, raising=False)
+
+    @staticmethod
+    def _palace(tmp_path, *, hnsw_count, sync_threshold=None, pickle_age=None, seg="seg-window"):
+        _seed_chroma_db(
+            str(tmp_path), sqlite_count=20_000, segment_id=seg, sync_threshold=sync_threshold
+        )
+        _write_pickle(str(tmp_path), seg, hnsw_count=hnsw_count)
+        if pickle_age is not None:
+            when = time.time() - pickle_age
+            os.utime(os.path.join(str(tmp_path), seg, "index_metadata.pickle"), (when, when))
+
+    # new behaviour
+
+    def test_allow_listed_fs_reuses_an_unchanged_verdict_past_ten_seconds(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        self._palace(tmp_path, hnsw_count=20_000)
+        self._fs(monkeypatch, "apfs")
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["status"] == "ok"
+        clock[0] += 11
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        clock[0] += 3_000
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1, "unchanged files on APFS: reuse within the hour"
+        clock[0] += 600
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2, "past the hour: re-probe"
+
+    def test_explicit_threshold_with_an_old_pickle_is_reused(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        """The asgard case: explicit sync threshold, small divergence, pickle hours old."""
+        self._palace(tmp_path, hnsw_count=19_900, sync_threshold=1_000, pickle_age=20_000)
+        self._fs(monkeypatch, "apfs")
+        first = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert first["status"] == "ok" and first["divergence"] == 100
+        clock[0] += 11
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION) == first
+        assert len(probe_runs) == 1
+
+    def test_young_pickle_divergence_is_reused_before_the_grace_ends(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        self._palace(tmp_path, hnsw_count=19_900, pickle_age=100)
+        self._fs(monkeypatch, "apfs")
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["status"] == "ok"
+        clock[0] += 150  # monotonic only: the wall clock has not reached the deadline
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1
+
+    def test_an_already_diverged_verdict_is_reused_within_its_window(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        self._palace(tmp_path, hnsw_count=2_000)
+        self._fs(monkeypatch, "apfs")
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["diverged"] is True
+        clock[0] += 11
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["diverged"] is True
+        assert len(probe_runs) == 1
+
+    def test_each_uncached_probe_logs_its_reason(self, tmp_path, clock, monkeypatch, caplog):
+        self._palace(tmp_path, hnsw_count=20_000)
+        self._fs(monkeypatch, "")
+        with caplog.at_level("INFO", logger="mempalace.backends.chroma"):
+            hnsw_capacity_status(str(tmp_path), COLLECTION)
+            hnsw_capacity_status(str(tmp_path), COLLECTION)
+            clock[0] += 11
+            hnsw_capacity_status(str(tmp_path), COLLECTION)
+        lines = [r.getMessage() for r in caplog.records if "hnsw capacity probe" in r.getMessage()]
+        assert len(lines) == 2, lines
+        assert "reason=first-call" in lines[0] and COLLECTION in lines[0]
+        assert "reason=window" in lines[1]
+
+    def test_fs_type_prefers_the_inode64_symbol(self):
+        from mempalace.backends import chroma as chroma_mod
+
+        fs_type = getattr(chroma_mod, "_fs_type", None)
+        assert fs_type is not None, "no _fs_type"
+
+        def filler(name):
+            def fill(_path, buf):
+                buf[72 : 72 + len(name)] = name
+                return 0
+
+            return fill
+
+        class Both:
+            statfs = staticmethod(filler(b"hfs"))
+
+        setattr(Both, "statfs$INODE64", staticmethod(filler(b"apfs")))
+
+        class PlainOnly:
+            statfs = staticmethod(filler(b"apfs"))
+
+        assert fs_type("/", libc=Both()) == "apfs"
+        assert fs_type("/", libc=PlainOnly()) == "apfs"
+
+    def test_fs_type_is_empty_for_a_missing_path(self, tmp_path):
+        from mempalace.backends import chroma as chroma_mod
+
+        fs_type = getattr(chroma_mod, "_fs_type", None)
+        assert fs_type is not None, "no _fs_type"
+        assert fs_type(str(tmp_path / "does-not-exist")) == ""
+
+    # behaviour preserved
+
+    def test_non_allow_listed_fs_reprobes_after_ten_seconds(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        self._palace(tmp_path, hnsw_count=20_000)
+        self._fs(monkeypatch, "hfs")
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        clock[0] += 11
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2
+
+    def test_unknown_hnsw_count_reprobes_after_ten_seconds(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        """No pickle: the verdict reads files the fingerprint does not cover."""
+        _seed_chroma_db(str(tmp_path), sqlite_count=20_000, segment_id="seg-nopickle")
+        os.makedirs(os.path.join(str(tmp_path), "seg-nopickle"), exist_ok=True)
+        self._fs(monkeypatch, "apfs")
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["hnsw_count"] is None
+        clock[0] += 11
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2
+
+    def test_young_pickle_divergence_reprobes_when_the_grace_ends(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        from mempalace.backends import chroma as chroma_mod
+
+        self._palace(tmp_path, hnsw_count=19_900, pickle_age=299)
+        self._fs(monkeypatch, "apfs")
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["status"] == "ok"
+        real_time = time.time
+        monkeypatch.setattr(chroma_mod.time, "time", lambda: real_time() + 5)
+        clock[0] += 5
+        after = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2, "the grace ended: re-probe with no file change"
+        assert after["status"] == "diverged"
+
+    def test_a_backward_wall_clock_step_does_not_extend_the_window(
+        self, tmp_path, probe_runs, clock, monkeypatch
+    ):
+        from mempalace.backends import chroma as chroma_mod
+
+        self._palace(tmp_path, hnsw_count=20_000)
+        self._fs(monkeypatch, "apfs")
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        real_time = time.time
+        monkeypatch.setattr(chroma_mod.time, "time", lambda: real_time() - 3_600)
+        clock[0] += 3_601
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2
+
+    def test_a_fingerprint_change_reprobes_at_once(self, tmp_path, probe_runs, clock, monkeypatch):
+        self._palace(tmp_path, hnsw_count=20_000, seg="seg-fp")
+        self._fs(monkeypatch, "apfs")
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        _write_pickle(str(tmp_path), "seg-fp", hnsw_count=2_000)
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["diverged"] is True
+        assert len(probe_runs) == 2
 
 
 # ── Stranded indexes: no pickle, and it is not flush-lag ──────────────
