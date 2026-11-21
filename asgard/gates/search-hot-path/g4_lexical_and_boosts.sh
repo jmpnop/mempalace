@@ -21,13 +21,26 @@ run_side fork lexical "$fork_clone" "$out/fork-eq.json" --cases "$cases/eq.json"
 echo "synthetic cases..."
 run_side base lexical "$base_syn" "$out/base-syn.json" --cases "$cases/synthetic.json"
 run_side fork lexical "$fork_syn" "$out/fork-syn.json" --cases "$cases/synthetic.json"
-echo "timed cases, 5 interleaved runs per side..."
-for i in 1 2 3 4 5; do
-  run_side base lexical "$base_clone" "$out/base-timed-$i.json" --cases "$cases/timed.json" --runs 1
-  run_side fork lexical "$fork_clone" "$out/fork-timed-$i.json" --cases "$cases/timed.json" --runs 1
+echo "timed cases, 8 interleaved rounds, order alternating (ABBA)..."
+for i in 1 2 3 4 5 6 7 8; do
+  if [ $((i % 4)) = 1 ] || [ $((i % 4)) = 0 ]; then order="base fork"; else order="fork base"; fi
+  for side in $order; do
+    copy="$base_clone"; [ "$side" = fork ] && copy="$fork_clone"
+    run_side "$side" lexical "$copy" "$out/$side-timed-$i.json" --cases "$cases/timed.json" --runs 1
+  done
 done
 echo "walk at the limit..."
 run_side fork walk_limit "$fork_syn" "$out/fork-walk.json" --value zz_big --runs 5
+echo "walk cost for every wing with closets..."
+"$PY" -I - "$cases/timed.json" > "$out/closet-wings.txt" <<'PYEOF'
+import json, sys
+for c in json.load(open(sys.argv[1])):
+    if c["name"].startswith("closets/"):
+        print(c["name"].split("/")[1], c["where"]["wing"], sep="\t")
+PYEOF
+while IFS=$'\t' read -r label value; do
+  run_side fork walk_limit "$fork_clone" "$out/fork-walk-$label.json" --value "$value" --runs 9
+done < "$out/closet-wings.txt"
 
 after="$(fingerprint "$FROZEN")"
 [ "$before" = "$after" ] || die "G4_FAILED the frozen palace changed during the run"
@@ -70,6 +83,12 @@ for name in [c["name"] for c in base_t[0]["cases"]]:
         good, rule = mf <= mb * 1.05 + 0.01, "<= 1.05 x BASE + 10 ms"
     ok = ok and good
     print(f"  {'ok ' if good else 'BAD'} {name:38s} BASE {mb:8.4f}  FORK {mf:8.4f}  ({rule})")
+for p in sorted(glob.glob(f"{out}/fork-walk-wing*.json")):
+    r = load(p)
+    label = p.rsplit("fork-walk-", 1)[1][:-5]
+    good = r["result"] == "hit" and r["median"] < 0.005
+    ok = ok and good
+    print(f"  {'ok ' if good else 'BAD'} walk cost {label}: {r['result']}, median {r['median'] * 1000:.3f} ms")
 w = load(f"{out}/fork-walk.json")
 print(f"walk at the limit: result {w['result']}, median {w['median']:.4f} s, runs {['%.4f' % t for t in w['times']]}")
 ok = ok and w["result"] == "limit" and w["median"] < 0.05
